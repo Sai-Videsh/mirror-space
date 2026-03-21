@@ -19,17 +19,25 @@ class PacketType(IntEnum):
 class DiffFrameEncoder:
     """Encodes frames using block-based differential compression"""
     
-    def __init__(self, block_size: int = 32, threshold: int = 10):
+    def __init__(
+        self,
+        block_size: int = 32,
+        threshold: int = 10,
+        max_changed_block_ratio: float = 0.30,
+    ):
         self.block_size = block_size
         self.threshold = threshold
+        self.max_changed_block_ratio = max_changed_block_ratio
         self.previous_frame: Optional[np.ndarray] = None
         self.last_frame_number = 0
         self.key_frame_needed = True
+        self.key_frame_reason = "initial_sync"
         
         # Statistics
         self.compression_ratio = 1.0
         self.changed_blocks_count = 0
         self.changed_blocks = []  # List of (x, y, w, h) tuples
+        self.last_changed_ratio = 0.0
     
     def _has_block_changed(self, frame1: np.ndarray, frame2: np.ndarray,
                           x: int, y: int, width: int, height: int) -> bool:
@@ -49,7 +57,12 @@ class DiffFrameEncoder:
         
         return avg_diff > self.threshold
     
-    def _encode_full_frame(self, frame: np.ndarray, frame_number: int) -> bytes:
+    def _encode_full_frame(
+        self,
+        frame: np.ndarray,
+        frame_number: int,
+        packet_type: PacketType = PacketType.FULL_FRAME,
+    ) -> bytes:
         """Encode a complete frame with JPEG compression"""
         height, width = frame.shape[:2]
         
@@ -61,7 +74,7 @@ class DiffFrameEncoder:
         # Build packet header
         # Format: B=type, I=frame_number, I=width, I=height, I=data_size, H=block_size
         header = struct.pack('<BIIIIH',
-                           PacketType.FULL_FRAME,
+                           packet_type,
                            frame_number,
                            width,
                            height,
@@ -100,6 +113,8 @@ class DiffFrameEncoder:
         # Calculate compression ratio
         original_size = height * width * 3
         self.compression_ratio = len(diff_data) / original_size if original_size > 0 else 0
+        total_blocks = ((width + self.block_size - 1) // self.block_size) * ((height + self.block_size - 1) // self.block_size)
+        self.last_changed_ratio = self.changed_blocks_count / total_blocks if total_blocks > 0 else 0.0
         
         # Build packet header
         header = struct.pack('<BIIIIH',
@@ -114,29 +129,45 @@ class DiffFrameEncoder:
     
     def encode(self, frame: np.ndarray, frame_number: int) -> bytes:
         """Encode a frame (returns full or diff frame data)"""
-        # Send full frame every 60 frames or if needed
-        send_full_frame = (self.key_frame_needed or 
-                          self.previous_frame is None or
-                          frame_number % 60 == 0)
-        
-        if send_full_frame:
-            data = self._encode_full_frame(frame, frame_number)
+        send_key_frame = self.key_frame_needed or self.previous_frame is None
+        diff_data = None
+
+        if not send_key_frame:
+            diff_data = self._encode_diff_frame(frame, frame_number)
+
+            # Escalate to key frame during high-motion scenes.
+            if self.last_changed_ratio >= self.max_changed_block_ratio:
+                self.key_frame_needed = True
+                self.key_frame_reason = (
+                    f"high_motion changed={self.last_changed_ratio:.1%} "
+                    f"threshold={self.max_changed_block_ratio:.1%}"
+                )
+                send_key_frame = True
+
+        if send_key_frame:
+            packet_type = PacketType.FULL_FRAME if self.previous_frame is None else PacketType.KEY_FRAME
+            data = self._encode_full_frame(frame, frame_number, packet_type=packet_type)
+            reason = self.key_frame_reason
             self.key_frame_needed = False
-            print(f"Sending FULL frame #{frame_number} ({len(data)} bytes)")
+            self.key_frame_reason = ""
+            frame_type = "FULL" if packet_type == PacketType.FULL_FRAME else "KEY"
+            print(f"Sending {frame_type} frame #{frame_number} ({len(data)} bytes) reason={reason}")
         else:
-            data = self._encode_diff_frame(frame, frame_number)
+            data = diff_data if diff_data is not None else self._encode_diff_frame(frame, frame_number)
             print(f"Sending DIFF frame #{frame_number} ({len(data)} bytes, "
                   f"{self.changed_blocks_count} blocks, "
-                  f"{self.compression_ratio*100:.1f}% of original)")
+                  f"{self.compression_ratio*100:.1f}% of original, "
+                  f"changed_ratio={self.last_changed_ratio:.1%})")
         
         self.previous_frame = frame.copy()
         self.last_frame_number = frame_number
         
         return data
     
-    def force_key_frame(self):
+    def force_key_frame(self, reason: str = "external_trigger"):
         """Force next frame to be a key frame"""
         self.key_frame_needed = True
+        self.key_frame_reason = reason
     
     def get_compression_ratio(self) -> float:
         """Get current compression ratio"""
@@ -156,11 +187,23 @@ class DiffFrameDecoder:
     
     def __init__(self):
         self.current_frame: Optional[np.ndarray] = None
+        self.last_frame_number: Optional[int] = None
+        self._last_error: Optional[str] = None
+
+    def _set_error(self, message: str):
+        self._last_error = message
+        print(f"Decoder mismatch: {message}")
+
+    def consume_decoder_error(self) -> Optional[str]:
+        """Read and clear decoder mismatch reason"""
+        error = self._last_error
+        self._last_error = None
+        return error
     
     def decode(self, data: bytes) -> Optional[np.ndarray]:
         """Decode received packet data"""
         if len(data) < 19:  # Minimum header size (1+4+4+4+4+2)
-            print(f"Packet too small: {len(data)} bytes")
+            self._set_error(f"packet_too_small size={len(data)}")
             return None
         
         # Parse header  
@@ -169,21 +212,33 @@ class DiffFrameDecoder:
             struct.unpack('<BIIIIH', data[:header_size])
         
         payload = data[header_size:]
+
+        if data_size != len(payload):
+            self._set_error(f"payload_size_mismatch expected={data_size} actual={len(payload)}")
+            return None
         
-        if packet_type == PacketType.FULL_FRAME:
+        if packet_type == PacketType.FULL_FRAME or packet_type == PacketType.KEY_FRAME:
             # Decode JPEG compressed frame
             nparr = np.frombuffer(payload, np.uint8)
             self.current_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if self.current_frame is None:
-                print("Failed to decode JPEG frame")
+                self._set_error("jpeg_decode_failed")
                 return None
             
-            print(f"Received FULL frame #{frame_number}")
+            label = "FULL" if packet_type == PacketType.FULL_FRAME else "KEY"
+            print(f"Received {label} frame #{frame_number}")
+            self.last_frame_number = frame_number
             
         elif packet_type == PacketType.DIFF_FRAME:
             if self.current_frame is None:
-                print("No reference frame for diff")
+                self._set_error("missing_reference_frame")
+                return None
+
+            if self.last_frame_number is not None and frame_number != self.last_frame_number + 1:
+                self._set_error(
+                    f"frame_gap expected={self.last_frame_number + 1} got={frame_number}"
+                )
                 return None
             
             # Apply diff blocks
@@ -201,7 +256,7 @@ class DiffFrameDecoder:
                 # Read pixel data
                 block_data_size = bw * bh * 3
                 if offset + block_data_size > len(payload):
-                    print("Incomplete block data")
+                    self._set_error("incomplete_block_data")
                     break
                 
                 # Apply block to current frame
@@ -217,5 +272,9 @@ class DiffFrameDecoder:
                 blocks_applied += 1
             
             print(f"Received DIFF frame #{frame_number} ({blocks_applied} blocks)")
+            self.last_frame_number = frame_number
+        else:
+            self._set_error(f"unknown_packet_type={packet_type}")
+            return None
         
         return self.current_frame.copy() if self.current_frame is not None else None

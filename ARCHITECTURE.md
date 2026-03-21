@@ -43,10 +43,16 @@
 
 ### 2. Diff Encoding (DiffFrameEncoder.cpp)
 
-#### Full Frame Mode (Every 60th frame)
+#### Full/Key Frame Mode (Adaptive)
 ```
 Input Frame (1920x1080x3) → JPEG Compress → PacketHeader + JPEG Data
 ```
+
+Key frame triggers:
+- Initial synchronization (startup)
+- High-motion frame (too many changed blocks)
+- Decoder mismatch request from receiver
+- Network instability report from receiver
 
 #### Diff Frame Mode
 ```
@@ -127,9 +133,10 @@ Typical ratios:
 - Acceptable packet loss for video
 
 ### 3. Adaptive Key Frames
-- Every 60 frames for sync
-- On demand if too many changes
-- Prevents error accumulation
+- Triggered by high changed-block ratio
+- Triggered by receiver decoder mismatch feedback
+- Triggered by receiver network instability feedback
+- Prevents drift and speeds up recovery after packet loss
 
 ### 4. Multi-Packet Fragmentation
 - Splits large frames

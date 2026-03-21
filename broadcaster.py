@@ -7,7 +7,7 @@ import sys
 import time
 import socket
 import struct
-from typing import Tuple
+from typing import Tuple, List
 
 import mss
 import numpy as np
@@ -68,6 +68,42 @@ class UDPBroadcaster:
     
     def close(self):
         """Close the socket"""
+        self.sock.close()
+
+
+class FeedbackReceiver:
+    """Receives receiver-side health feedback to trigger key frames"""
+
+    def __init__(self, port: int):
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('0.0.0.0', port))
+        self.sock.setblocking(False)
+        print(f"Feedback channel listening on port {port}")
+
+    def poll_messages(self, max_messages: int = 8) -> List[str]:
+        """Read available feedback messages without blocking"""
+        messages: List[str] = []
+
+        for _ in range(max_messages):
+            try:
+                data, addr = self.sock.recvfrom(4096)
+            except BlockingIOError:
+                break
+            except Exception as e:
+                print(f"Feedback receive failed: {e}")
+                break
+
+            message = data.decode('utf-8', errors='ignore').strip()
+            if message:
+                print(f"Feedback from {addr[0]}:{addr[1]} -> {message}")
+                messages.append(message)
+
+        return messages
+
+    def close(self):
+        """Close feedback socket"""
         self.sock.close()
 
 
@@ -153,10 +189,14 @@ def main():
         print()
     
     # Initialize components
+    capture = None
+    broadcaster = None
+    feedback_receiver = None
     try:
         capture = ScreenCapture()
-        encoder = DiffFrameEncoder(block_size=32, threshold=10)
+        encoder = DiffFrameEncoder(block_size=32, threshold=10, max_changed_block_ratio=0.30)
         broadcaster = UDPBroadcaster(target_ip, port)
+        feedback_receiver = FeedbackReceiver(port + 1)
         
         # Create heatmap window if enabled
         heatmap_enabled = SHOW_HEATMAP
@@ -174,6 +214,13 @@ def main():
         
         while True:
             frame_start = time.time()
+
+            # Process receiver feedback before encoding the next frame.
+            for message in feedback_receiver.poll_messages():
+                if message.startswith("KEYFRAME_REQUEST"):
+                    encoder.force_key_frame(reason=f"receiver_mismatch {message}")
+                elif message.startswith("NETWORK_UNSTABLE"):
+                    encoder.force_key_frame(reason=f"network_instability {message}")
             
             # Capture screen
             frame = capture.capture_frame()
@@ -234,8 +281,12 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        capture.close()
-        broadcaster.close()
+        if capture is not None:
+            capture.close()
+        if broadcaster is not None:
+            broadcaster.close()
+        if feedback_receiver is not None:
+            feedback_receiver.close()
         print("Broadcaster stopped.")
 
 

@@ -101,6 +101,16 @@ Same performance as C++ version:
 | Web browsing | 3 MB/s | 12% | 55ms |
 | Video playback | 12 MB/s | 18% | 85ms |
 
+## Adaptive Key Frames (v1 Upgrade)
+
+The sender now uses a dynamic key-frame strategy instead of fixed "every 60 frames":
+
+- Sends key frame when changed-block ratio is high (high-motion scene)
+- Sends key frame when receiver reports decoder mismatch
+- Sends key frame when receiver reports network instability
+
+This improves stream resilience under packet loss and rapid scene changes.
+
 ## Python vs C++
 
 ### Python Advantages
