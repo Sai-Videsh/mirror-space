@@ -7,18 +7,24 @@ import sys
 import time
 import socket
 import struct
-from typing import Tuple, List
+import secrets
+from typing import Tuple, List, Optional
 
 import mss
 import numpy as np
 import cv2
+from zeroconf import ServiceInfo, Zeroconf
 
 from diff_encoder import DiffFrameEncoder
 
 
 DEFAULT_PORT = 9999
+DEFAULT_BROADCAST_TARGET = "255.255.255.255"
+SERVICE_TYPE = "_mirror-space._udp.local."
+DISCOVERY_BEACON_PORT = 10001
+DISCOVERY_BEACON_INTERVAL = 1.0
 MAX_PACKET_SIZE = 65507  # Max UDP packet size
-FRAGMENT_HEADER_SIZE = 8  # total_packets (4) + packet_index (4)
+FRAGMENT_HEADER_SIZE = 12  # total_packets (4) + packet_index (4) + frame_number (4)
 MAX_UDP_PAYLOAD_SIZE = 1400  # MTU-safe payload to avoid IP fragmentation on LAN/WiFi
 TARGET_FPS = 15
 FRAME_INTERVAL = 1.0 / TARGET_FPS
@@ -28,6 +34,94 @@ MAX_DIFF_PAYLOAD_RATIO = 0.25  # Fallback to key frame when diff payload gets to
 JPEG_QUALITY = 60  # Lower quality reduces packet count and loss on busy scenes
 MAX_STREAM_WIDTH = 1280  # Resize captured frame if screen width is larger than this
 ENABLE_MOTION_DETECTION = True  # Enable optical flow-based motion encoding
+
+
+def get_primary_ipv4() -> str:
+    """Resolve the primary outbound IPv4 address for LAN service registration."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    except Exception:
+        return socket.gethostbyname(socket.gethostname())
+    finally:
+        probe.close()
+
+
+class StreamAdvertiser:
+    """Publishes this broadcaster on LAN using mDNS/Zeroconf."""
+
+    def __init__(self, stream_port: int, feedback_port: int):
+        self.stream_port = stream_port
+        self.feedback_port = feedback_port
+        self.zeroconf = Zeroconf()
+        self.info: ServiceInfo | None = None
+
+    def start(self):
+        host_name = socket.gethostname()
+        instance = f"{host_name}-{self.stream_port}"
+        service_name = f"{instance}.{SERVICE_TYPE}"
+        ip_addr = get_primary_ipv4()
+
+        properties = {
+            b"stream_name": host_name.encode("utf-8"),
+            b"stream_port": str(self.stream_port).encode("utf-8"),
+            b"feedback_port": str(self.feedback_port).encode("utf-8"),
+            b"version": b"1",
+        }
+
+        self.info = ServiceInfo(
+            type_=SERVICE_TYPE,
+            name=service_name,
+            addresses=[socket.inet_aton(ip_addr)],
+            port=self.stream_port,
+            properties=properties,
+            server=f"{host_name}.local.",
+        )
+
+        self.zeroconf.register_service(self.info, allow_name_change=True)
+        print(f"mDNS stream advertisement started: {host_name} ({ip_addr}:{self.stream_port})")
+
+    def close(self):
+        if self.info is not None:
+            try:
+                self.zeroconf.unregister_service(self.info)
+            except Exception:
+                pass
+        self.zeroconf.close()
+
+
+class UdpDiscoveryBeacon:
+    """Broadcasts stream availability periodically on LAN."""
+
+    def __init__(self, stream_name: str, stream_port: int, feedback_port: int):
+        self.stream_name = stream_name
+        self.stream_port = stream_port
+        self.feedback_port = feedback_port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.last_sent = 0.0
+
+    def tick(self):
+        now = time.time()
+        if now - self.last_sent < DISCOVERY_BEACON_INTERVAL:
+            return
+
+        message = (
+            "STREAM_ANNOUNCE "
+            f"stream_name={self.stream_name} "
+            f"stream_port={self.stream_port} "
+            f"feedback_port={self.feedback_port}"
+        )
+        try:
+            self.sock.sendto(message.encode("utf-8"), ("255.255.255.255", DISCOVERY_BEACON_PORT))
+            self.last_sent = now
+        except Exception:
+            # Discovery is best-effort; stream transport should continue even if beacon fails.
+            pass
+
+    def close(self):
+        self.sock.close()
 
 
 class UDPBroadcaster:
@@ -44,7 +138,7 @@ class UDPBroadcaster:
         
         print(f"UDP broadcaster initialized to {target_ip}:{port}")
     
-    def send_data(self, data: bytes) -> bool:
+    def send_data(self, data: bytes, frame_number: int) -> bool:
         """Send data with automatic fragmentation"""
         offset = 0
         packet_index = 0
@@ -59,8 +153,8 @@ class UDPBroadcaster:
             chunk_size = min(max_chunk_size, len(data) - offset)
             
             # Create packet with metadata
-            # Format: I=total_packets, I=packet_index, then data
-            packet = struct.pack('<II', total_packets, packet_index)
+            # Format: I=total_packets, I=packet_index, I=frame_number, then data
+            packet = struct.pack('<III', total_packets, packet_index, frame_number)
             packet += data[offset:offset + chunk_size]
             
             try:
@@ -94,9 +188,9 @@ class FeedbackReceiver:
         self.sock.setblocking(False)
         print(f"Feedback channel listening on port {port}")
 
-    def poll_messages(self, max_messages: int = 8) -> List[str]:
+    def poll_messages(self, max_messages: int = 8) -> List[Tuple[str, Tuple[str, int]]]:
         """Read available feedback messages without blocking"""
-        messages: List[str] = []
+        messages: List[Tuple[str, Tuple[str, int]]] = []
 
         for _ in range(max_messages):
             try:
@@ -110,13 +204,20 @@ class FeedbackReceiver:
             message = data.decode('utf-8', errors='ignore').strip()
             if message:
                 print(f"Feedback from {addr[0]}:{addr[1]} -> {message}")
-                messages.append(message)
+                messages.append((message, addr))
 
         return messages
 
     def close(self):
         """Close feedback socket"""
         self.sock.close()
+
+    def send_message(self, target_ip: str, target_port: int, message: str):
+        """Send a short UDP control message."""
+        try:
+            self.sock.sendto(message.encode('utf-8'), (target_ip, target_port))
+        except Exception as e:
+            print(f"Feedback send failed: {e}")
 
 
 class ScreenCapture:
@@ -190,7 +291,7 @@ def create_heatmap_overlay(frame: np.ndarray, changed_blocks, motion_blocks, blo
 
 
 def main():
-    target_ip = "127.0.0.1"  # Default: localhost
+    target_ip = DEFAULT_BROADCAST_TARGET  # Default: LAN broadcast (no manual receiver IP)
     port = DEFAULT_PORT
     
     if len(sys.argv) > 1:
@@ -217,6 +318,8 @@ def main():
     capture = None
     broadcaster = None
     feedback_receiver = None
+    advertiser = None
+    beacon = None
     try:
         capture = ScreenCapture()
         encoder = DiffFrameEncoder(
@@ -229,6 +332,21 @@ def main():
         )
         broadcaster = UDPBroadcaster(target_ip, port)
         feedback_receiver = FeedbackReceiver(port + 1)
+        advertiser = StreamAdvertiser(stream_port=port, feedback_port=port + 1)
+        advertiser.start()
+        stream_name = socket.gethostname()
+        access_id = secrets.token_hex(3).upper()
+        local_host_name = socket.gethostname().lower()
+        local_primary_ip = get_primary_ipv4()
+        beacon = UdpDiscoveryBeacon(stream_name=stream_name, stream_port=port, feedback_port=port + 1)
+
+        auto_connect_mode = target_ip == DEFAULT_BROADCAST_TARGET
+        active_receiver_ip: Optional[str] = None
+        last_wait_log_time = 0.0
+        if auto_connect_mode:
+            print("Broadcaster is ready. Waiting for receiver connection...")
+            print(f"Session Access ID: {access_id}")
+            print("Streaming will start only after RECEIVER_HELLO is received.\n")
         
         # Create heatmap window if enabled
         heatmap_enabled = SHOW_HEATMAP
@@ -246,13 +364,74 @@ def main():
         
         while True:
             frame_start = time.time()
+            beacon.tick()
 
             # Process receiver feedback before encoding the next frame.
-            for message in feedback_receiver.poll_messages():
+            for message, addr in feedback_receiver.poll_messages():
+                sender_ip = addr[0]
+
+                if message.startswith("DISCOVERY_QUERY"):
+                    feedback_receiver.send_message(
+                        sender_ip,
+                        addr[1],
+                        (
+                            "DISCOVERY_RESPONSE "
+                            f"stream_name={stream_name} "
+                            f"stream_port={port} "
+                            f"feedback_port={port + 1}"
+                        ),
+                    )
+                    continue
+
+                if message.startswith("RECEIVER_HELLO") and auto_connect_mode:
+                    receiver_access_id = ""
+                    receiver_name = ""
+                    for token in message.split():
+                        if token.startswith("receiver="):
+                            receiver_name = token.split("=", 1)[1].strip().lower()
+                        elif token.startswith("access_id="):
+                            receiver_access_id = token.split("=", 1)[1].strip().upper()
+
+                    if receiver_access_id != access_id:
+                        print(
+                            "Connection Debug: rejected receiver hello due to invalid access ID "
+                            f"from {sender_ip}"
+                        )
+                        continue
+
+                    same_host = (
+                        sender_ip == "127.0.0.1"
+                        or sender_ip == local_primary_ip
+                        or receiver_name == local_host_name
+                    )
+
+                    if active_receiver_ip != sender_ip:
+                        active_receiver_ip = sender_ip
+                        broadcaster.target_ip = "127.0.0.1" if same_host else active_receiver_ip
+                        print(
+                            f"Receiver connected: {active_receiver_ip}. "
+                            "Starting stream transmission."
+                        )
+                        if same_host:
+                            print("Connection Debug: same-host receiver detected, using loopback target 127.0.0.1")
+                    continue
+
+                if active_receiver_ip is not None and sender_ip != active_receiver_ip:
+                    # Ignore health events from non-selected receivers in connect-gated mode.
+                    continue
+
                 if message.startswith("KEYFRAME_REQUEST"):
                     encoder.force_key_frame(reason=f"receiver_mismatch {message}")
                 elif message.startswith("NETWORK_UNSTABLE"):
                     encoder.force_key_frame(reason=f"network_instability {message}")
+
+            if auto_connect_mode and active_receiver_ip is None:
+                now = time.time()
+                if now - last_wait_log_time >= 2.0:
+                    print("Connection Debug: waiting for RECEIVER_HELLO on feedback port")
+                    last_wait_log_time = now
+                time.sleep(0.05)
+                continue
             
             # Capture screen
             frame = capture.capture_frame()
@@ -293,7 +472,7 @@ def main():
                         cv2.namedWindow("Broadcaster Heatmap", cv2.WINDOW_NORMAL)
             
             # Send via UDP
-            if not broadcaster.send_data(encoded_data):
+            if not broadcaster.send_data(encoded_data, frame_number=frame_number):
                 print("Failed to send frame")
             
             frame_number += 1
@@ -326,6 +505,10 @@ def main():
             broadcaster.close()
         if feedback_receiver is not None:
             feedback_receiver.close()
+        if advertiser is not None:
+            advertiser.close()
+        if beacon is not None:
+            beacon.close()
         print("Broadcaster stopped.")
 
 

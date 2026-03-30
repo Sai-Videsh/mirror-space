@@ -7,18 +7,407 @@ import sys
 import time
 import socket
 import struct
-from typing import Dict, Optional, Tuple
+import threading
+import platform
+import ipaddress
+import queue
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, List
 
 import cv2
 import numpy as np
+from zeroconf import ServiceBrowser, ServiceInfo, ServiceStateChange, Zeroconf
 
 from diff_encoder import DiffFrameDecoder
 
 
 DEFAULT_PORT = 9999
+SERVICE_TYPE = "_mirror-space._udp.local."
+DISCOVERY_BEACON_PORT = 10001
 MAX_PACKET_SIZE = 65507
-RECEIVE_TIMEOUT = 5.0  # seconds
-FRAGMENT_HEADER_SIZE = 8  # total_packets (4) + packet_index (4)
+RECEIVE_TIMEOUT = 0.05  # seconds
+FRAGMENT_HEADER_SIZE = 12  # total_packets (4) + packet_index (4) + frame_number (4)
+DISCOVERY_INTERVAL_SECONDS = 1.0
+REASSEMBLY_WINDOW_SECONDS = 0.60
+SUBNET_SCAN_INTERVAL_SECONDS = 8.0
+SUBNET_SCAN_BATCH_SIZE = 24
+
+
+@dataclass
+class StreamInfoRecord:
+    """Tracks one discovered LAN stream."""
+
+    service_name: str
+    stream_name: str
+    ip: str
+    stream_port: int
+    feedback_port: int
+    last_seen: float
+
+
+def _decode_property(raw: Dict[bytes, bytes], key: bytes, default: str = "") -> str:
+    value = raw.get(key, default.encode("utf-8"))
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def get_local_ipv4_addresses() -> set[str]:
+    """Collect local IPv4 addresses used to detect same-machine sessions."""
+    ips = {"127.0.0.1"}
+    try:
+        for result in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM):
+            ips.add(result[4][0])
+    except Exception:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        ips.add(probe.getsockname()[0])
+        probe.close()
+    except Exception:
+        pass
+    return ips
+
+
+class StreamDiscovery:
+    """Discovers active Mirror-Space broadcasters over mDNS."""
+
+    def __init__(self):
+        self.zeroconf = Zeroconf()
+        self.lock = threading.Lock()
+        self.streams: Dict[str, StreamInfoRecord] = {}
+        self.browser = ServiceBrowser(
+            self.zeroconf,
+            SERVICE_TYPE,
+            handlers=[self._on_service_state_change],
+        )
+
+    def _on_service_state_change(
+        self,
+        zeroconf: Zeroconf,
+        service_type: str,
+        name: str,
+        state_change: ServiceStateChange,
+    ):
+        if state_change == ServiceStateChange.Removed:
+            with self.lock:
+                self.streams.pop(name, None)
+            return
+
+        info = zeroconf.get_service_info(service_type, name, timeout=250)
+        if info is None:
+            return
+
+        parsed = self._parse_service_info(name, info)
+        if parsed is None:
+            return
+
+        with self.lock:
+            self.streams[name] = parsed
+
+    def _parse_service_info(self, name: str, info: ServiceInfo) -> Optional[StreamInfoRecord]:
+        addresses = info.parsed_addresses(version=socket.AF_INET)
+        if not addresses:
+            return None
+
+        props = info.properties or {}
+        stream_name = _decode_property(props, b"stream_name", default=name.split(".")[0])
+        stream_port_str = _decode_property(props, b"stream_port", default=str(info.port))
+        feedback_port_str = _decode_property(props, b"feedback_port", default=str(info.port + 1))
+
+        try:
+            stream_port = int(stream_port_str)
+        except ValueError:
+            stream_port = info.port
+
+        try:
+            feedback_port = int(feedback_port_str)
+        except ValueError:
+            feedback_port = stream_port + 1
+
+        return StreamInfoRecord(
+            service_name=name,
+            stream_name=stream_name,
+            ip=addresses[0],
+            stream_port=stream_port,
+            feedback_port=feedback_port,
+            last_seen=time.time(),
+        )
+
+    def get_streams(self, target_port: int) -> List[StreamInfoRecord]:
+        with self.lock:
+            items = [
+                stream
+                for stream in self.streams.values()
+                if stream.stream_port == target_port
+            ]
+        return sorted(items, key=lambda item: item.stream_name.lower())
+
+    def close(self):
+        self.zeroconf.close()
+
+
+class UdpStreamDiscovery:
+    """Fallback LAN discovery using UDP broadcast query/response."""
+
+    def __init__(self, feedback_port: int):
+        self.feedback_port = feedback_port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", 0))
+        self.sock.setblocking(False)
+        self.last_query_time = 0.0
+        self.streams: Dict[str, StreamInfoRecord] = {}
+
+    def _send_query_if_needed(self):
+        now = time.time()
+        if now - self.last_query_time < DISCOVERY_INTERVAL_SECONDS:
+            return
+
+        try:
+            self.sock.sendto(b"DISCOVERY_QUERY", ("255.255.255.255", self.feedback_port))
+            self.last_query_time = now
+        except Exception:
+            pass
+
+    def poll(self, stream_port: int):
+        self._send_query_if_needed()
+
+        for _ in range(32):
+            try:
+                data, addr = self.sock.recvfrom(1024)
+            except BlockingIOError:
+                break
+            except Exception:
+                break
+
+            text = data.decode("utf-8", errors="ignore").strip()
+            if not text.startswith("DISCOVERY_RESPONSE"):
+                continue
+
+            tokens = text.split()
+            kv: Dict[str, str] = {}
+            for token in tokens[1:]:
+                if "=" not in token:
+                    continue
+                key, value = token.split("=", 1)
+                kv[key] = value
+
+            try:
+                parsed_stream_port = int(kv.get("stream_port", str(stream_port)))
+            except ValueError:
+                parsed_stream_port = stream_port
+
+            if parsed_stream_port != stream_port:
+                continue
+
+            try:
+                feedback_port = int(kv.get("feedback_port", str(stream_port + 1)))
+            except ValueError:
+                feedback_port = stream_port + 1
+
+            stream_name = kv.get("stream_name", addr[0])
+            self.streams[addr[0]] = StreamInfoRecord(
+                service_name=f"udp-{addr[0]}",
+                stream_name=stream_name,
+                ip=addr[0],
+                stream_port=parsed_stream_port,
+                feedback_port=feedback_port,
+                last_seen=time.time(),
+            )
+
+    def get_streams(self, stream_port: int) -> List[StreamInfoRecord]:
+        now = time.time()
+        items = [
+            stream
+            for stream in self.streams.values()
+            if stream.stream_port == stream_port and (now - stream.last_seen) <= 5.0
+        ]
+        return sorted(items, key=lambda item: item.stream_name.lower())
+
+    def close(self):
+        self.sock.close()
+
+
+class UdpBeaconDiscovery:
+    """Passive LAN discovery by listening for broadcaster beacons."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", DISCOVERY_BEACON_PORT))
+        self.sock.setblocking(False)
+        self.streams: Dict[str, StreamInfoRecord] = {}
+
+    def poll(self, stream_port: int):
+        for _ in range(32):
+            try:
+                data, addr = self.sock.recvfrom(1024)
+            except BlockingIOError:
+                break
+            except Exception:
+                break
+
+            text = data.decode("utf-8", errors="ignore").strip()
+            if not text.startswith("STREAM_ANNOUNCE"):
+                continue
+
+            kv: Dict[str, str] = {}
+            for token in text.split()[1:]:
+                if "=" not in token:
+                    continue
+                key, value = token.split("=", 1)
+                kv[key] = value
+
+            try:
+                parsed_stream_port = int(kv.get("stream_port", str(stream_port)))
+            except ValueError:
+                parsed_stream_port = stream_port
+
+            if parsed_stream_port != stream_port:
+                continue
+
+            try:
+                feedback_port = int(kv.get("feedback_port", str(stream_port + 1)))
+            except ValueError:
+                feedback_port = stream_port + 1
+
+            stream_name = kv.get("stream_name", addr[0])
+            self.streams[addr[0]] = StreamInfoRecord(
+                service_name=f"beacon-{addr[0]}",
+                stream_name=stream_name,
+                ip=addr[0],
+                stream_port=parsed_stream_port,
+                feedback_port=feedback_port,
+                last_seen=time.time(),
+            )
+
+    def get_streams(self, stream_port: int) -> List[StreamInfoRecord]:
+        now = time.time()
+        items = [
+            stream
+            for stream in self.streams.values()
+            if stream.stream_port == stream_port and (now - stream.last_seen) <= 5.0
+        ]
+        return sorted(items, key=lambda item: item.stream_name.lower())
+
+    def close(self):
+        self.sock.close()
+
+
+class UdpSubnetDiscovery:
+    """Active /24 subnet scan for broadcasters that reply to DISCOVERY_QUERY."""
+
+    def __init__(self, feedback_port: int):
+        self.feedback_port = feedback_port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", 0))
+        self.sock.setblocking(False)
+        self.streams: Dict[str, StreamInfoRecord] = {}
+        self._scan_hosts: List[str] = []
+        self._scan_index = 0
+        self._last_scan_time = 0.0
+        self.subnet_label = "unknown"
+        self._init_scan_targets()
+
+    def _init_scan_targets(self):
+        local_ip = "127.0.0.1"
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect(("8.8.8.8", 80))
+            local_ip = probe.getsockname()[0]
+            probe.close()
+        except Exception:
+            pass
+
+        network = ipaddress.ip_network(f"{local_ip}/24", strict=False)
+        self.subnet_label = str(network)
+        self._scan_hosts = [str(host) for host in network.hosts()]
+
+    def _start_scan_if_needed(self):
+        now = time.time()
+        if self._scan_index < len(self._scan_hosts):
+            return
+        if now - self._last_scan_time < SUBNET_SCAN_INTERVAL_SECONDS:
+            return
+        self._scan_index = 0
+        self._last_scan_time = now
+
+    def _probe_hosts(self):
+        if self._scan_index >= len(self._scan_hosts):
+            return
+
+        end = min(self._scan_index + SUBNET_SCAN_BATCH_SIZE, len(self._scan_hosts))
+        for i in range(self._scan_index, end):
+            host = self._scan_hosts[i]
+            try:
+                self.sock.sendto(b"DISCOVERY_QUERY", (host, self.feedback_port))
+            except Exception:
+                pass
+        self._scan_index = end
+
+    def _consume_responses(self, stream_port: int):
+        for _ in range(64):
+            try:
+                data, addr = self.sock.recvfrom(1024)
+            except BlockingIOError:
+                break
+            except Exception:
+                break
+
+            text = data.decode("utf-8", errors="ignore").strip()
+            if not text.startswith("DISCOVERY_RESPONSE"):
+                continue
+
+            kv: Dict[str, str] = {}
+            for token in text.split()[1:]:
+                if "=" not in token:
+                    continue
+                key, value = token.split("=", 1)
+                kv[key] = value
+
+            try:
+                parsed_stream_port = int(kv.get("stream_port", str(stream_port)))
+            except ValueError:
+                parsed_stream_port = stream_port
+
+            if parsed_stream_port != stream_port:
+                continue
+
+            try:
+                feedback_port = int(kv.get("feedback_port", str(stream_port + 1)))
+            except ValueError:
+                feedback_port = stream_port + 1
+
+            stream_name = kv.get("stream_name", addr[0])
+            self.streams[addr[0]] = StreamInfoRecord(
+                service_name=f"subnet-{addr[0]}",
+                stream_name=stream_name,
+                ip=addr[0],
+                stream_port=parsed_stream_port,
+                feedback_port=feedback_port,
+                last_seen=time.time(),
+            )
+
+    def poll(self, stream_port: int):
+        self._start_scan_if_needed()
+        self._probe_hosts()
+        self._consume_responses(stream_port)
+
+    def get_streams(self, stream_port: int) -> List[StreamInfoRecord]:
+        now = time.time()
+        items = [
+            stream
+            for stream in self.streams.values()
+            if stream.stream_port == stream_port and (now - stream.last_seen) <= 12.0
+        ]
+        return sorted(items, key=lambda item: item.stream_name.lower())
+
+    def close(self):
+        self.sock.close()
 
 
 class UDPReceiver:
@@ -44,23 +433,38 @@ class UDPReceiver:
         
         print(f"UDP receiver initialized on port {port}")
     
-    def receive_data(self) -> Tuple[Optional[bytes], Optional[Dict], Optional[Tuple[str, int]]]:
+    def receive_data(
+        self,
+        expected_source_ip: Optional[str] = None,
+    ) -> Tuple[Optional[bytes], Optional[Dict], Optional[Tuple[str, int]]]:
         """Receive and reassemble fragmented data"""
         packets: Dict[int, bytes] = {}
         total_packets = 0
+        active_frame_number: Optional[int] = None
         start_time = time.time()
         source_addr: Optional[Tuple[str, int]] = None
         partial_due_to_timeout = False
         
         while True:
+            elapsed = time.time() - start_time
+
+            # Keep loop responsive even when no packets are arriving.
+            if elapsed > REASSEMBLY_WINDOW_SECONDS and not packets:
+                return None, None, source_addr
+
             # Check timeout
-            if time.time() - start_time > 1.0 and packets:
+            if elapsed > REASSEMBLY_WINDOW_SECONDS and packets:
                 partial_due_to_timeout = True
                 break  # Partial frame, return what we have
             
             try:
                 data, addr = self.sock.recvfrom(MAX_PACKET_SIZE)
             except socket.timeout:
+                if (time.time() - start_time) > REASSEMBLY_WINDOW_SECONDS:
+                    if not packets:
+                        return None, None, source_addr
+                    partial_due_to_timeout = True
+                    break
                 continue
             except Exception as e:
                 print(f"Receive error: {e}")
@@ -69,17 +473,30 @@ class UDPReceiver:
             if len(data) < FRAGMENT_HEADER_SIZE:
                 continue  # Too small for header
 
-            source_addr = addr
+            if expected_source_ip is not None and addr[0] != expected_source_ip:
+                continue
+
+            if source_addr is None:
+                source_addr = addr
+            elif addr[0] != source_addr[0] or addr[1] != source_addr[1]:
+                # Ignore packets from other broadcasters while assembling this frame.
+                continue
             
             # Parse packet header
-            total, index = struct.unpack('<II', data[:FRAGMENT_HEADER_SIZE])
+            total, index, frame_number = struct.unpack('<III', data[:FRAGMENT_HEADER_SIZE])
             payload = data[FRAGMENT_HEADER_SIZE:]
 
             if total <= 0 or index >= total:
                 continue
 
-            if total_packets == 0:
+            # Start new reassembly only when packet 0 arrives.
+            if active_frame_number is None:
+                if index != 0:
+                    continue
+                active_frame_number = frame_number
                 total_packets = total
+            elif frame_number != active_frame_number:
+                continue
             elif total != total_packets:
                 continue
             
@@ -101,7 +518,6 @@ class UDPReceiver:
             if i in packets:
                 result.extend(packets[i])
             else:
-                print(f"Missing packet {i} of {total_packets}")
                 missing_count += 1
 
         is_complete = missing_count == 0 and not partial_due_to_timeout
@@ -117,6 +533,7 @@ class UDPReceiver:
             "missing_packets": missing_count,
             "total_packets": total_packets,
             "timed_out": partial_due_to_timeout,
+            "frame_number": active_frame_number,
         }
 
         # Never decode partial payloads; wait for a complete frame to keep decoder state valid.
@@ -135,6 +552,7 @@ class FeedbackSender:
 
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.last_send_time: Dict[str, float] = {}
 
     def send(
@@ -162,23 +580,77 @@ class FeedbackSender:
         self.sock.close()
 
 
+class TerminalSelectionReader:
+    """Reads stream selection from terminal input (e.g., type 1 + Enter)."""
+
+    def __init__(self):
+        self.queue: "queue.Queue[str]" = queue.Queue()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            try:
+                text = input().strip()
+            except EOFError:
+                return
+            except Exception:
+                continue
+
+            if not text:
+                continue
+
+            self.queue.put(text)
+
+    def poll_input(self) -> Optional[str]:
+        try:
+            return self.queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self.stop_event.set()
+
+
 def main():
     port = DEFAULT_PORT
+    bootstrap_ip: Optional[str] = None
     
     if len(sys.argv) > 1:
-        port = int(sys.argv[1])
+        try:
+            port = int(sys.argv[1])
+        except ValueError:
+            bootstrap_ip = sys.argv[1]
+    if len(sys.argv) > 2:
+        bootstrap_ip = sys.argv[2]
     
     print("=== Mirror-Space Screen Receiver (Python) ===")
     print(f"Listening on port: {port}")
+    if bootstrap_ip:
+        print(f"Bootstrap broadcaster IP: {bootstrap_ip}")
     print("Press ESC or 'q' to quit...\n")
     
     # Initialize receiver
     receiver = None
     feedback = None
+    discovery = None
+    udp_discovery = None
+    beacon_discovery = None
+    subnet_discovery = None
+    terminal_selector = None
     try:
         receiver = UDPReceiver(port)
         decoder = DiffFrameDecoder()
         feedback = FeedbackSender()
+        terminal_selector = TerminalSelectionReader()
+        terminal_selector.start()
+        discovery = StreamDiscovery()
+        udp_discovery = UdpStreamDiscovery(feedback_port=port + 1)
+        beacon_discovery = UdpBeaconDiscovery()
+        subnet_discovery = UdpSubnetDiscovery(feedback_port=port + 1)
         
         # Create display window
         cv2.namedWindow("Mirror-Space Receiver", cv2.WINDOW_NORMAL)
@@ -191,15 +663,132 @@ def main():
         window_missing_packets = 0
         window_total_packets = 0
         sender_ip: Optional[str] = None
+        selected_stream_ip: Optional[str] = None
+        selected_stream_name: Optional[str] = None
+        selected_stream_feedback_port: Optional[int] = None
+        selected_access_id: Optional[str] = None
+        connected = False
+        local_name = platform.node() or socket.gethostname()
+        local_ips = get_local_ipv4_addresses()
+        local_mode_logged = False
+        discovery_print_time = 0.0
+        last_discovery_signature = ""
+        last_hello_log_time = 0.0
+        latest_streams: List[StreamInfoRecord] = []
+        waiting_for_manual_selection_logged = False
+        waiting_for_access_id_logged = False
         
         print("Waiting for frames...\n")
         
         while True:
+            # Refresh stream list UI periodically.
+            now = time.time()
+            udp_discovery.poll(stream_port=port)
+            beacon_discovery.poll(stream_port=port)
+            subnet_discovery.poll(stream_port=port)
+            mdns_streams = discovery.get_streams(port)
+            udp_streams = udp_discovery.get_streams(stream_port=port)
+            beacon_streams = beacon_discovery.get_streams(stream_port=port)
+            subnet_streams = subnet_discovery.get_streams(stream_port=port)
+
+            streams_by_ip: Dict[str, StreamInfoRecord] = {item.ip: item for item in mdns_streams}
+            for item in udp_streams:
+                if item.ip not in streams_by_ip:
+                    streams_by_ip[item.ip] = item
+            for item in beacon_streams:
+                if item.ip not in streams_by_ip:
+                    streams_by_ip[item.ip] = item
+            for item in subnet_streams:
+                if item.ip not in streams_by_ip:
+                    streams_by_ip[item.ip] = item
+            streams = sorted(streams_by_ip.values(), key=lambda item: item.stream_name.lower())
+            latest_streams = streams
+            if selected_stream_ip is not None and all(item.ip != selected_stream_ip for item in streams) and not bootstrap_ip:
+                selected_stream_ip = None
+                selected_stream_name = None
+                selected_stream_feedback_port = None
+                selected_access_id = None
+                connected = False
+            if selected_stream_ip is None and bootstrap_ip:
+                selected_stream_ip = bootstrap_ip
+                selected_stream_name = f"Manual-{bootstrap_ip}"
+                selected_stream_feedback_port = port + 1
+                selected_access_id = None
+                print(
+                    "Connection Debug: using bootstrap target "
+                    f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
+                )
+            if selected_stream_ip is None and streams and not waiting_for_manual_selection_logged and not bootstrap_ip:
+                print("Connection Debug: waiting for manual stream selection (press 1-9)")
+                waiting_for_manual_selection_logged = True
+
+            if now - discovery_print_time >= 2.0:
+                signature_parts = [f"{item.stream_name}:{item.ip}" for item in streams]
+                signature = "|".join(signature_parts) + f"|selected={selected_stream_ip}"
+                if signature != last_discovery_signature:
+                    print(
+                        "Discovery Debug: "
+                        f"mdns={len(mdns_streams)} "
+                        f"udp_query={len(udp_streams)} "
+                        f"udp_beacon={len(beacon_streams)} "
+                        f"subnet_scan={len(subnet_streams)}"
+                    )
+                    print(f"Available Streams in subnet {subnet_discovery.subnet_label}:")
+                    if streams:
+                        print("Press number 1-9 in receiver window OR type number + Enter in terminal")
+                        print("After selecting, type broadcaster Session Access ID and press Enter")
+                        for idx, item in enumerate(streams, start=1):
+                            marker = "*" if item.ip == selected_stream_ip else "-"
+                            if idx <= 9:
+                                print(f"{marker} [{idx}] {item.stream_name} ({item.ip})")
+                            else:
+                                print(f"{marker} [ ] {item.stream_name} ({item.ip})")
+                    else:
+                        print("- none")
+                    last_discovery_signature = signature
+                discovery_print_time = now
+
+            if selected_stream_ip and selected_stream_feedback_port and selected_access_id:
+                feedback.send(
+                    selected_stream_ip,
+                    selected_stream_feedback_port,
+                    f"RECEIVER_HELLO receiver={local_name} access_id={selected_access_id}",
+                    throttle_seconds=1.0,
+                    throttle_key="RECEIVER_HELLO",
+                )
+                # Fallback path: some LAN setups pass broadcast but drop peer-to-peer unicast.
+                feedback.send(
+                    "255.255.255.255",
+                    selected_stream_feedback_port,
+                    f"RECEIVER_HELLO receiver={local_name} access_id={selected_access_id}",
+                    throttle_seconds=1.0,
+                    throttle_key="RECEIVER_HELLO_BROADCAST",
+                )
+                if (not connected) and (time.time() - last_hello_log_time >= 2.0):
+                    print(
+                        "Connection Debug: sent RECEIVER_HELLO to "
+                        f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
+                    )
+                    last_hello_log_time = time.time()
+            elif selected_stream_ip and selected_stream_feedback_port and not selected_access_id:
+                if not waiting_for_access_id_logged:
+                    print("Connection Debug: waiting for Session Access ID in terminal")
+                    waiting_for_access_id_logged = True
+
             # Receive data
-            received_data, meta, source_addr = receiver.receive_data()
+            expected_source_ip = selected_stream_ip
+            if selected_stream_ip in local_ips:
+                expected_source_ip = None
+                if not local_mode_logged:
+                    print("Connection Debug: local receiver mode enabled (accepting loopback stream source)")
+                    local_mode_logged = True
+            received_data, meta, source_addr = receiver.receive_data(expected_source_ip=expected_source_ip)
 
             if source_addr is not None:
                 sender_ip = source_addr[0]
+                if not connected and sender_ip == selected_stream_ip:
+                    connected = True
+                    print(f"Connected to stream: {selected_stream_name} ({sender_ip})")
             
             if received_data:
                 # Decode frame
@@ -256,7 +845,8 @@ def main():
             elapsed = time.time() - fps_start_time
             if elapsed >= 1.0:
                 actual_fps = frames_received / elapsed
-                print(f"Receive FPS: {actual_fps:.1f}")
+                if connected or frames_received > 0:
+                    print(f"Receive FPS: {actual_fps:.1f}")
                 frames_received = 0
                 fps_start_time = time.time()
             
@@ -264,6 +854,52 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord('q'):  # ESC or 'q'
                 break
+            if ord('1') <= key <= ord('9'):
+                index = key - ord('1')
+                if 0 <= index < len(latest_streams):
+                    chosen = latest_streams[index]
+                    selected_stream_ip = chosen.ip
+                    selected_stream_name = chosen.stream_name
+                    selected_stream_feedback_port = chosen.feedback_port
+                    selected_access_id = None
+                    connected = False
+                    local_mode_logged = False
+                    waiting_for_manual_selection_logged = False
+                    waiting_for_access_id_logged = False
+                    print(
+                        "Connection Debug: manually selected "
+                        f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
+                    )
+                    print("Connection Debug: enter Session Access ID in terminal and press Enter")
+
+            # Terminal fallback selection (type 1..9 + Enter)
+            user_text = terminal_selector.poll_input() if terminal_selector is not None else None
+            if user_text is not None:
+                normalized = user_text.strip()
+                if normalized.lower() in {"q", "quit", "exit"}:
+                    break
+                elif normalized.isdigit() and 1 <= int(normalized) <= 9:
+                    selected_index = int(normalized) - 1
+                    if 0 <= selected_index < len(latest_streams):
+                        chosen = latest_streams[selected_index]
+                        selected_stream_ip = chosen.ip
+                        selected_stream_name = chosen.stream_name
+                        selected_stream_feedback_port = chosen.feedback_port
+                        selected_access_id = None
+                        connected = False
+                        local_mode_logged = False
+                        waiting_for_manual_selection_logged = False
+                        waiting_for_access_id_logged = False
+                        print(
+                            "Connection Debug: manually selected (terminal) "
+                            f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
+                        )
+                        print("Connection Debug: enter Session Access ID in terminal and press Enter")
+                elif selected_stream_ip and selected_stream_feedback_port:
+                    selected_access_id = normalized.upper()
+                    connected = False
+                    waiting_for_access_id_logged = False
+                    print("Connection Debug: Session Access ID captured, attempting handshake")
     
     except KeyboardInterrupt:
         print("\nStopping receiver...")
@@ -276,6 +912,16 @@ def main():
             receiver.close()
         if feedback is not None:
             feedback.close()
+        if discovery is not None:
+            discovery.close()
+        if udp_discovery is not None:
+            udp_discovery.close()
+        if beacon_discovery is not None:
+            beacon_discovery.close()
+        if subnet_discovery is not None:
+            subnet_discovery.close()
+        if terminal_selector is not None:
+            terminal_selector.stop()
         cv2.destroyAllWindows()
         print("Receiver stopped.")
 

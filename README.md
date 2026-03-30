@@ -24,7 +24,7 @@ python receiver.py
 
 **Terminal 2 (Broadcaster):**
 ```powershell
-python broadcaster.py 127.0.0.1
+python broadcaster.py
 ```
 
 You should see your screen mirrored instantly!
@@ -48,22 +48,50 @@ Total download: ~100 MB (one-time)
 python receiver.py
 
 # Terminal 2
-python broadcaster.py 127.0.0.1
+python broadcaster.py
 ```
 
 ### Network Broadcasting
 ```powershell
-# On viewing PC (find IP with: ipconfig)
+# On viewing PC
 python receiver.py
 
 # On broadcasting PC
-python broadcaster.py 192.168.1.100
+python broadcaster.py
 ```
+
+### LAN Auto Discovery (mDNS / Zeroconf)
+
+Receivers now automatically discover broadcasters on your LAN.
+
+Receiver console example:
+
+```text
+Available Streams:
+* Kousthub-PC (192.168.1.23)
+- Lab-System (192.168.1.40)
+```
+
+- `*` marks the currently selected stream.
+- No manual IP entry is required in normal LAN use.
+
+### Connection-Gated Streaming (New)
+
+The broadcaster no longer pushes video immediately in auto-discovery mode.
+
+Flow:
+
+1. Broadcaster starts and advertises "ready" on mDNS.
+2. Receiver discovers available streams and auto-selects one.
+3. Receiver sends a connect hello (`RECEIVER_HELLO`).
+4. Broadcaster logs receiver connection and starts streaming.
+
+This ensures streaming starts only after a receiver has connected.
 
 ### Custom Port
 ```powershell
 python receiver.py 8888
-python broadcaster.py 192.168.1.100 8888
+python broadcaster.py 255.255.255.255 8888
 ```
 
 ### Adjust FPS
