@@ -584,7 +584,7 @@ class TerminalSelectionReader:
     """Reads stream selection from terminal input (e.g., type 1 + Enter)."""
 
     def __init__(self):
-        self.queue: "queue.Queue[int]" = queue.Queue()
+        self.queue: "queue.Queue[str]" = queue.Queue()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -603,16 +603,9 @@ class TerminalSelectionReader:
             if not text:
                 continue
 
-            if text.lower() in {"q", "quit", "exit"}:
-                self.queue.put(-1)
-                continue
+            self.queue.put(text)
 
-            if text.isdigit():
-                value = int(text)
-                if 1 <= value <= 9:
-                    self.queue.put(value - 1)
-
-    def poll_index(self) -> Optional[int]:
+    def poll_input(self) -> Optional[str]:
         try:
             return self.queue.get_nowait()
         except queue.Empty:
@@ -673,6 +666,7 @@ def main():
         selected_stream_ip: Optional[str] = None
         selected_stream_name: Optional[str] = None
         selected_stream_feedback_port: Optional[int] = None
+        selected_access_id: Optional[str] = None
         connected = False
         local_name = platform.node() or socket.gethostname()
         local_ips = get_local_ipv4_addresses()
@@ -682,6 +676,7 @@ def main():
         last_hello_log_time = 0.0
         latest_streams: List[StreamInfoRecord] = []
         waiting_for_manual_selection_logged = False
+        waiting_for_access_id_logged = False
         
         print("Waiting for frames...\n")
         
@@ -712,11 +707,13 @@ def main():
                 selected_stream_ip = None
                 selected_stream_name = None
                 selected_stream_feedback_port = None
+                selected_access_id = None
                 connected = False
             if selected_stream_ip is None and bootstrap_ip:
                 selected_stream_ip = bootstrap_ip
                 selected_stream_name = f"Manual-{bootstrap_ip}"
                 selected_stream_feedback_port = port + 1
+                selected_access_id = None
                 print(
                     "Connection Debug: using bootstrap target "
                     f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
@@ -739,6 +736,7 @@ def main():
                     print(f"Available Streams in subnet {subnet_discovery.subnet_label}:")
                     if streams:
                         print("Press number 1-9 in receiver window OR type number + Enter in terminal")
+                        print("After selecting, type broadcaster Session Access ID and press Enter")
                         for idx, item in enumerate(streams, start=1):
                             marker = "*" if item.ip == selected_stream_ip else "-"
                             if idx <= 9:
@@ -750,11 +748,11 @@ def main():
                     last_discovery_signature = signature
                 discovery_print_time = now
 
-            if selected_stream_ip and selected_stream_feedback_port:
+            if selected_stream_ip and selected_stream_feedback_port and selected_access_id:
                 feedback.send(
                     selected_stream_ip,
                     selected_stream_feedback_port,
-                    f"RECEIVER_HELLO receiver={local_name}",
+                    f"RECEIVER_HELLO receiver={local_name} access_id={selected_access_id}",
                     throttle_seconds=1.0,
                     throttle_key="RECEIVER_HELLO",
                 )
@@ -762,7 +760,7 @@ def main():
                 feedback.send(
                     "255.255.255.255",
                     selected_stream_feedback_port,
-                    f"RECEIVER_HELLO receiver={local_name}",
+                    f"RECEIVER_HELLO receiver={local_name} access_id={selected_access_id}",
                     throttle_seconds=1.0,
                     throttle_key="RECEIVER_HELLO_BROADCAST",
                 )
@@ -772,6 +770,10 @@ def main():
                         f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
                     )
                     last_hello_log_time = time.time()
+            elif selected_stream_ip and selected_stream_feedback_port and not selected_access_id:
+                if not waiting_for_access_id_logged:
+                    print("Connection Debug: waiting for Session Access ID in terminal")
+                    waiting_for_access_id_logged = True
 
             # Receive data
             expected_source_ip = selected_stream_ip
@@ -859,31 +861,45 @@ def main():
                     selected_stream_ip = chosen.ip
                     selected_stream_name = chosen.stream_name
                     selected_stream_feedback_port = chosen.feedback_port
+                    selected_access_id = None
                     connected = False
                     local_mode_logged = False
                     waiting_for_manual_selection_logged = False
+                    waiting_for_access_id_logged = False
                     print(
                         "Connection Debug: manually selected "
                         f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
                     )
+                    print("Connection Debug: enter Session Access ID in terminal and press Enter")
 
             # Terminal fallback selection (type 1..9 + Enter)
-            selected_index = terminal_selector.poll_index() if terminal_selector is not None else None
-            if selected_index is not None:
-                if selected_index == -1:
+            user_text = terminal_selector.poll_input() if terminal_selector is not None else None
+            if user_text is not None:
+                normalized = user_text.strip()
+                if normalized.lower() in {"q", "quit", "exit"}:
                     break
-                if 0 <= selected_index < len(latest_streams):
-                    chosen = latest_streams[selected_index]
-                    selected_stream_ip = chosen.ip
-                    selected_stream_name = chosen.stream_name
-                    selected_stream_feedback_port = chosen.feedback_port
+                elif normalized.isdigit() and 1 <= int(normalized) <= 9:
+                    selected_index = int(normalized) - 1
+                    if 0 <= selected_index < len(latest_streams):
+                        chosen = latest_streams[selected_index]
+                        selected_stream_ip = chosen.ip
+                        selected_stream_name = chosen.stream_name
+                        selected_stream_feedback_port = chosen.feedback_port
+                        selected_access_id = None
+                        connected = False
+                        local_mode_logged = False
+                        waiting_for_manual_selection_logged = False
+                        waiting_for_access_id_logged = False
+                        print(
+                            "Connection Debug: manually selected (terminal) "
+                            f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
+                        )
+                        print("Connection Debug: enter Session Access ID in terminal and press Enter")
+                elif selected_stream_ip and selected_stream_feedback_port:
+                    selected_access_id = normalized.upper()
                     connected = False
-                    local_mode_logged = False
-                    waiting_for_manual_selection_logged = False
-                    print(
-                        "Connection Debug: manually selected (terminal) "
-                        f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
-                    )
+                    waiting_for_access_id_logged = False
+                    print("Connection Debug: Session Access ID captured, attempting handshake")
     
     except KeyboardInterrupt:
         print("\nStopping receiver...")

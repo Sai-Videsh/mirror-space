@@ -7,6 +7,7 @@ import sys
 import time
 import socket
 import struct
+import secrets
 from typing import Tuple, List, Optional
 
 import mss
@@ -334,6 +335,7 @@ def main():
         advertiser = StreamAdvertiser(stream_port=port, feedback_port=port + 1)
         advertiser.start()
         stream_name = socket.gethostname()
+        access_id = secrets.token_hex(3).upper()
         local_host_name = socket.gethostname().lower()
         local_primary_ip = get_primary_ipv4()
         beacon = UdpDiscoveryBeacon(stream_name=stream_name, stream_port=port, feedback_port=port + 1)
@@ -343,6 +345,7 @@ def main():
         last_wait_log_time = 0.0
         if auto_connect_mode:
             print("Broadcaster is ready. Waiting for receiver connection...")
+            print(f"Session Access ID: {access_id}")
             print("Streaming will start only after RECEIVER_HELLO is received.\n")
         
         # Create heatmap window if enabled
@@ -381,11 +384,20 @@ def main():
                     continue
 
                 if message.startswith("RECEIVER_HELLO") and auto_connect_mode:
+                    receiver_access_id = ""
                     receiver_name = ""
                     for token in message.split():
                         if token.startswith("receiver="):
                             receiver_name = token.split("=", 1)[1].strip().lower()
-                            break
+                        elif token.startswith("access_id="):
+                            receiver_access_id = token.split("=", 1)[1].strip().upper()
+
+                    if receiver_access_id != access_id:
+                        print(
+                            "Connection Debug: rejected receiver hello due to invalid access ID "
+                            f"from {sender_ip}"
+                        )
+                        continue
 
                     same_host = (
                         sender_ip == "127.0.0.1"
