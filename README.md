@@ -101,6 +101,69 @@ TARGET_FPS = 20  # Lower for less bandwidth
 TARGET_FPS = 60  # Higher for smoother
 ```
 
+## 🎯 Region-Based Screen Capture (New!)
+
+Capture only the area you need to drastically reduce bandwidth.
+
+### Three Capture Modes
+
+When you run the broadcaster, you'll be prompted to select a capture mode:
+
+1. **Full Screen** - Capture entire display (default)
+2. **Specific Window** - Select and capture a single application window  
+3. **Custom Region** - Click and drag to select any rectangular region
+
+### Quick Test
+
+Test the region selector without starting the broadcaster:
+
+```powershell
+python test_region_selector.py
+```
+
+This will show you:
+- All available modes
+- Preview of the selected region
+- Bandwidth savings analysis
+- Verification that the feature works
+
+### Usage Examples
+
+```powershell
+# Terminal 1 (Receiver)
+python receiver.py
+
+# Terminal 2 (Broadcaster) - will prompt for region selection
+python broadcaster.py
+```
+
+When prompted:
+```
+REGION-BASED SCREEN CAPTURE - SELECT CAPTURE MODE
+1. Full Screen
+2. Specific Window  
+3. Custom Region
+
+Enter your choice (1-3): 3
+```
+
+### Bandwidth Reduction Example
+
+| Capture Mode | Resolution | Bandwidth Savings |
+|-------------|------------|-------------------|
+| Full Screen | 1920x1080 | Baseline (100%) |
+| Half Region | 1280x720 | ~44% reduction |
+| Quarter Region | 960x540 | ~75% reduction |
+| App Window | 1024x768 | ~60% reduction |
+
+### For Detailed Testing
+
+See [REGION_CAPTURE_GUIDE.md](REGION_CAPTURE_GUIDE.md) for:
+- Step-by-step testing procedures
+- Performance benchmarking
+- Troubleshooting guide
+- Bandwidth analysis
+
 ## Configuration
 
 ### In `broadcaster.py`:

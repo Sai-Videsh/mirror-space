@@ -615,6 +615,9 @@ class TerminalSelectionReader:
         self.stop_event.set()
 
 
+
+
+
 def main():
     port = DEFAULT_PORT
     bootstrap_ip: Optional[str] = None
@@ -631,7 +634,7 @@ def main():
     print(f"Listening on port: {port}")
     if bootstrap_ip:
         print(f"Bootstrap broadcaster IP: {bootstrap_ip}")
-    print("Press ESC or 'q' to quit...\n")
+
     
     # Initialize receiver
     receiver = None
@@ -749,10 +752,11 @@ def main():
                 discovery_print_time = now
 
             if selected_stream_ip and selected_stream_feedback_port and selected_access_id:
+                hello_msg = f"RECEIVER_HELLO receiver={local_name} access_id={selected_access_id}"
                 feedback.send(
                     selected_stream_ip,
                     selected_stream_feedback_port,
-                    f"RECEIVER_HELLO receiver={local_name} access_id={selected_access_id}",
+                    hello_msg,
                     throttle_seconds=1.0,
                     throttle_key="RECEIVER_HELLO",
                 )
@@ -760,7 +764,7 @@ def main():
                 feedback.send(
                     "255.255.255.255",
                     selected_stream_feedback_port,
-                    f"RECEIVER_HELLO receiver={local_name} access_id={selected_access_id}",
+                    hello_msg,
                     throttle_seconds=1.0,
                     throttle_key="RECEIVER_HELLO_BROADCAST",
                 )
@@ -772,6 +776,7 @@ def main():
                     last_hello_log_time = time.time()
             elif selected_stream_ip and selected_stream_feedback_port and not selected_access_id:
                 if not waiting_for_access_id_logged:
+                    print("\n[IMPORTANT] Type the 6-character Session Access ID from broadcaster terminal:")
                     print("Connection Debug: waiting for Session Access ID in terminal")
                     waiting_for_access_id_logged = True
 
@@ -870,6 +875,7 @@ def main():
                         "Connection Debug: manually selected "
                         f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
                     )
+                    print("\n[IMPORTANT] Now type the 6-character Session Access ID (check broadcaster terminal)")
                     print("Connection Debug: enter Session Access ID in terminal and press Enter")
 
             # Terminal fallback selection (type 1..9 + Enter)
@@ -894,6 +900,7 @@ def main():
                             "Connection Debug: manually selected (terminal) "
                             f"{selected_stream_name} ({selected_stream_ip}:{selected_stream_feedback_port})"
                         )
+                        print("\n[IMPORTANT] Now type the 6-character Session Access ID (check broadcaster terminal)")
                         print("Connection Debug: enter Session Access ID in terminal and press Enter")
                 elif selected_stream_ip and selected_stream_feedback_port:
                     selected_access_id = normalized.upper()

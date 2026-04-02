@@ -10,12 +10,21 @@ import struct
 import secrets
 from typing import Tuple, List, Optional
 
-import mss
 import numpy as np
 import cv2
 from zeroconf import ServiceInfo, Zeroconf
 
+# Windows-specific libraries for HWND-based window capture
+try:
+    import win32gui
+    import win32ui
+    import win32con
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
 from diff_encoder import DiffFrameEncoder
+from region_selector import get_region_config
 
 
 DEFAULT_PORT = 9999
@@ -220,32 +229,363 @@ class FeedbackReceiver:
             print(f"Feedback send failed: {e}")
 
 
-class ScreenCapture:
-    """Captures screen using mss library"""
+class HWNDWindowCapture:
+    """Captures screen from a specific window using its HWND (never changes capture source)"""
     
-    def __init__(self):
-        self.sct = mss.mss()
-        self.monitor = self.sct.monitors[1]  # Primary monitor
-        print(f"Screen capture initialized: {self.monitor['width']}x{self.monitor['height']}")
+    def __init__(self, hwnd: Optional[int] = None):
+        """
+        Initialize window capture
+        
+        Args:
+            hwnd: Window handle. If None, falls back to full screen via region mode
+        """
+        self.hwnd = hwnd
+        self.presentation_mode = False
+        self.last_error = None
+        
+        if self.hwnd is None:
+            print("WARNING: No HWND provided. Will use region-based capture.")
+            print("This may switch content if tabs/windows change.")
+        else:
+            print(f"HWNDWindowCapture initialized with HWND: {self.hwnd}")
+            print("Capturing ONLY this specific window - tab switches won't affect stream")
+    
+    def set_presentation_mode(self, enabled: bool):
+        """Enable/disable presentation mode (black background)"""
+        self.presentation_mode = enabled
+        if enabled:
+            print("\n*** PRESENTATION MODE ENABLED ***")
+            print("    Capturing window on BLACK background")
+            print("    Other windows/tabs won't affect broadcast\n")
+    
+    def _is_window_valid(self) -> bool:
+        """Check if window still exists and is not minimized"""
+        if self.hwnd is None:
+            return False
+        
+        try:
+            # Check if window exists
+            if not win32gui.IsWindow(self.hwnd):
+                self.last_error = "Window no longer exists"
+                return False
+            
+            # Check if window is minimized
+            if win32gui.IsIconic(self.hwnd):
+                self.last_error = "Window is minimized"
+                return False
+            
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            return False
+    
+    def get_window_dimensions(self) -> Optional[Tuple[int, int, int, int]]:
+        """Get current window dimensions (x, y, width, height)"""
+        if self.hwnd is None:
+            return None
+        
+        try:
+            rect = win32gui.GetWindowRect(self.hwnd)
+            x, y, x2, y2 = rect
+            width = x2 - x
+            height = y2 - y
+            return (x, y, width, height)
+        except Exception as e:
+            print(f"Error getting window dimensions: {e}")
+            return None
     
     def capture_frame(self) -> np.ndarray:
-        """Capture current screen frame"""
-        # Capture screen
-        screenshot = self.sct.grab(self.monitor)
+        """Capture frame from the selected window using HWND"""
         
-        # Convert to numpy array (BGR format for OpenCV)
-        frame = np.array(screenshot)
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        if not HAS_WIN32:
+            print("ERROR: win32gui/win32ui not available. Install with: pip install pywin32")
+            return np.zeros((480, 640, 3), dtype=np.uint8)
         
-        return frame
+        if self.hwnd is None:
+            print("ERROR: No HWND set")
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        
+        # Validate window still exists
+        if not self._is_window_valid():
+            print(f"ERROR: Cannot capture - {self.last_error}")
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        
+        try:
+            # Get window dimensions
+            dims = self.get_window_dimensions()
+            if dims is None:
+                return np.zeros((480, 640, 3), dtype=np.uint8)
+            
+            x, y, width, height = dims
+            
+            # Validate dimensions
+            if width <= 0 or height <= 0:
+                print(f"WARNING: Invalid window dimensions: {width}x{height}")
+                return np.zeros((100, 100, 3), dtype=np.uint8)
+            
+            # Capture the window
+            frame = self._capture_window_direct(x, y, width, height)
+            
+            if self.presentation_mode:
+                # Add presentation mode: black background
+                frame = self._add_presentation_background(frame, x, y, width, height)
+            
+            return frame
+            
+        except Exception as e:
+            print(f"Capture error: {e}")
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+    
+    def _capture_window_direct(self, x: int, y: int, width: int, height: int) -> np.ndarray:
+        """Capture window content using pure ctypes - no win32ui dependency"""
+        import ctypes
+        from ctypes import windll, c_void_p, c_int, c_uint32, byref, create_string_buffer
+        try:
+            # Get client area dimensions (matches what PrintWindow captures)
+            client_rect = win32gui.GetClientRect(self.hwnd)
+            client_width = client_rect[2] - client_rect[0]
+            client_height = client_rect[3] - client_rect[1]
+            if client_width <= 0 or client_height <= 0:
+                client_width, client_height = max(1, width), max(1, height)
+            gdi32 = windll.gdi32
+            user32 = windll.user32
+            hwnd_dc = user32.GetDC(self.hwnd)
+            if not hwnd_dc:
+                raise RuntimeError("GetDC failed")
+            mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+            bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, client_width, client_height)
+            gdi32.SelectObject(mem_dc, bitmap)
+            PW_CLIENTONLY = 0x1
+            result = user32.PrintWindow(self.hwnd, mem_dc, PW_CLIENTONLY)
+            if result == 0:
+                screen_dc = user32.GetDC(0)
+                gdi32.BitBlt(mem_dc, 0, 0, client_width, client_height, screen_dc, x, y, 0x00CC0020)
+                user32.ReleaseDC(0, screen_dc)
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", c_uint32), ("biWidth", c_int), ("biHeight", c_int),
+                    ("biPlanes", ctypes.c_uint16), ("biBitCount", ctypes.c_uint16),
+                    ("biCompression", c_uint32), ("biSizeImage", c_uint32),
+                    ("biXPelsPerMeter", c_int), ("biYPelsPerMeter", c_int),
+                    ("biClrUsed", c_uint32), ("biClrImportant", c_uint32),
+                ]
+            bmi = BITMAPINFOHEADER()
+            bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.biWidth = client_width
+            bmi.biHeight = -client_height
+            bmi.biPlanes = 1
+            bmi.biBitCount = 32
+            bmi.biCompression = 0
+            buf_size = client_width * client_height * 4
+            buf = create_string_buffer(buf_size)
+            lines = gdi32.GetDIBits(mem_dc, bitmap, 0, client_height, buf, byref(bmi), 0)
+            gdi32.DeleteObject(bitmap)
+            gdi32.DeleteDC(mem_dc)
+            user32.ReleaseDC(self.hwnd, hwnd_dc)
+            if lines == 0:
+                raise RuntimeError("GetDIBits returned 0 lines")
+            frame = np.frombuffer(buf.raw, dtype=np.uint8).reshape((client_height, client_width, 4))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            return frame
+        except Exception as e:
+            print(f"Window capture failed: {e}")
+            return np.zeros((max(1, height), max(1, width), 3), dtype=np.uint8)
+    
+    def _add_presentation_background(self, frame: np.ndarray, x: int, y: int, width: int, height: int) -> np.ndarray:
+        """Add presentation mode: place window on black background"""
+        try:
+            # Get primary screen dimensions
+            screen_width = win32gui.GetSystemMetrics(0)
+            screen_height = win32gui.GetSystemMetrics(1)
+            
+            # Create black background
+            bg_frame = np.zeros((screen_height, screen_width, 3), dtype=np.uint8)
+            
+            # Place window content at correct position
+            y_end = min(y + height, screen_height)
+            x_end = min(x + width, screen_width)
+            
+            bg_frame[y:y_end, x:x_end] = frame[:y_end-y, :x_end-x]
+            
+            return bg_frame
+            
+        except Exception as e:
+            print(f"Presentation background error: {e}")
+            return frame
     
     def get_dimensions(self) -> Tuple[int, int]:
-        """Get screen dimensions"""
-        return self.monitor['width'], self.monitor['height']
+        """Get capture dimensions"""
+        dims = self.get_window_dimensions()
+        if dims:
+            return (dims[2], dims[3])  # width, height
+        return (640, 480)  # default fallback
+    
+    def get_full_dimensions(self) -> Tuple[int, int]:
+        """Get full screen dimensions (for presentation mode)"""
+        try:
+            width = win32gui.GetSystemMetrics(0)
+            height = win32gui.GetSystemMetrics(1)
+            return (width, height)
+        except:
+            return (1920, 1080)  # default fallback
     
     def close(self):
         """Clean up resources"""
-        self.sct.close()
+        pass  # win32 resources are handled automatically
+
+
+class ScreenCapture:
+    """Captures screen using mss library with region support"""
+    
+    def __init__(self):
+        # Dynamic capture: will use either HWND or region-based
+        self.use_hwnd = False
+        self.hwnd_capture: Optional[HWNDWindowCapture] = None
+        
+        # Fallback: region-based capture
+        try:
+            import mss
+            self.sct = mss.mss()
+            self.monitor = self.sct.monitors[1]  # Primary monitor
+            self.full_width = self.monitor['width']
+            self.full_height = self.monitor['height']
+        except:
+            self.sct = None
+            self.full_width = 1920
+            self.full_height = 1080
+        
+        # Region configuration (default to full screen)
+        self.region_x = 0
+        self.region_y = 0
+        self.region_width = self.full_width
+        self.region_height = self.full_height
+        
+        # Presentation mode flag
+        self.presentation_mode = False
+        
+        print(f"Screen capture initialized: {self.full_width}x{self.full_height}")
+    
+    def set_region(self, x: int, y: int, width: int, height: int, hwnd: Optional[int] = None, presentation_mode: bool = False):
+        """Set the capture region or HWND"""
+        self.presentation_mode = presentation_mode
+
+        # If HWND is provided and win32 is available, use HWND-based capture
+        if hwnd is not None and HAS_WIN32:
+            print(f"\n*** USING HWND-BASED CAPTURE (Window Handle: {hwnd}) ***")
+            print(f"    This window ONLY will be captured")
+            print(f"    Tab switches and other windows WILL NOT affect the broadcast")
+            print(f"    If window resizes, capture will adjust automatically\n")
+
+            # Ensure we always set HWND mode when valid
+            self.use_hwnd = True
+            self.hwnd_capture = HWNDWindowCapture(hwnd)
+            self.hwnd_capture.set_presentation_mode(presentation_mode)
+
+            # Get initial dimensions
+            dims = self.hwnd_capture.get_window_dimensions()
+            if dims:
+                self.region_width = dims[2]
+                self.region_height = dims[3]
+
+            return
+        
+        # Fall back to region-based capture
+        print(f"\n*** USING REGION-BASED CAPTURE ***")
+        print(f"    Window coordinates: x={x}, y={y}, width={width}, height={height}")
+        print(f"    Note: Tab switches may affect capture\n")
+        
+        self.use_hwnd = False
+        self.hwnd_capture = None
+        
+        # Window bounds
+        window_left = x
+        window_top = y
+        window_right = x + width
+        window_bottom = y + height
+        
+        # Screen bounds
+        screen_left = 0
+        screen_top = 0
+        screen_right = self.full_width
+        screen_bottom = self.full_height
+        
+        # Calculate intersection (visible portion)
+        visible_left = max(window_left, screen_left)
+        visible_top = max(window_top, screen_top)
+        visible_right = min(window_right, screen_right)
+        visible_bottom = min(window_bottom, screen_bottom)
+        
+        # Convert to coordinates
+        self.region_x = visible_left
+        self.region_y = visible_top
+        self.region_width = max(100, visible_right - visible_left)
+        self.region_height = max(100, visible_bottom - visible_top)
+        
+        # Validate
+        if self.region_x < 0 or self.region_y < 0:
+            print(f"WARNING: Invalid capture coordinates - using full screen")
+            self.region_x = 0
+            self.region_y = 0
+            self.region_width = self.full_width
+            self.region_height = self.full_height
+    
+    def capture_frame(self) -> np.ndarray:
+        """Capture current screen frame"""
+        
+        # Use HWND-based capture if available
+        if self.use_hwnd and self.hwnd_capture:
+            return self.hwnd_capture.capture_frame()
+        
+        # Fall back to region-based capture using mss
+        if self.sct is None:
+            return np.zeros((self.region_height, self.region_width, 3), dtype=np.uint8)
+        
+        try:
+            region_monitor = {
+                'left': self.region_x,
+                'top': self.region_y,
+                'width': self.region_width,
+                'height': self.region_height
+            }
+            
+            screenshot = self.sct.grab(region_monitor)
+            frame = np.array(screenshot)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            
+            if self.presentation_mode:
+                # Add presentation background
+                bg_frame = np.zeros((self.full_height, self.full_width, 3), dtype=np.uint8)
+                y_end = min(self.region_y + self.region_height, self.full_height)
+                x_end = min(self.region_x + self.region_width, self.full_width)
+                bg_frame[self.region_y:y_end, self.region_x:x_end] = frame[:y_end - self.region_y, :x_end - self.region_x]
+                return bg_frame
+            
+            return frame
+        except Exception as e:
+            print(f"Capture error: {e}")
+            return np.zeros((self.region_height, self.region_width, 3), dtype=np.uint8)
+    
+    def get_dimensions(self) -> Tuple[int, int]:
+        """Get capture dimensions (region dimensions, not full screen)"""
+        if self.use_hwnd and self.hwnd_capture:
+            return self.hwnd_capture.get_dimensions()
+        return self.region_width, self.region_height
+    
+    def get_full_dimensions(self) -> Tuple[int, int]:
+        """Get full screen dimensions"""
+        if self.use_hwnd and self.hwnd_capture:
+            return self.hwnd_capture.get_full_dimensions()
+        return self.full_width, self.full_height
+    
+    def close(self):
+        """Clean up resources"""
+        if self.hwnd_capture:
+            self.hwnd_capture.close()
+        if self.sct:
+            try:
+                self.sct.close()
+            except:
+                pass
 
 
 def create_heatmap_overlay(frame: np.ndarray, changed_blocks, motion_blocks, block_size: int) -> np.ndarray:
@@ -321,10 +661,23 @@ def main():
     advertiser = None
     beacon = None
     try:
+        
         capture = ScreenCapture()
+        
+        # Region selection
+        full_width, full_height = capture.get_full_dimensions()
+        region_config = get_region_config(full_width, full_height)
+        
+        if region_config is None:
+            print("Region selection cancelled. Exiting.")
+            return
+        
+        # Apply selected region to capture
+        capture.set_region(region_config.x, region_config.y, region_config.width, region_config.height, region_config.hwnd, region_config.presentation_mode)
+        
         encoder = DiffFrameEncoder(
-            block_size=32,
-            threshold=10,
+            block_size=16,
+            threshold=4,
             max_changed_block_ratio=MAX_CHANGED_BLOCK_RATIO,
             max_diff_payload_ratio=MAX_DIFF_PAYLOAD_RATIO,
             jpeg_quality=JPEG_QUALITY,
@@ -344,9 +697,12 @@ def main():
         active_receiver_ip: Optional[str] = None
         last_wait_log_time = 0.0
         if auto_connect_mode:
+            print("\n" + "="*60)
             print("Broadcaster is ready. Waiting for receiver connection...")
-            print(f"Session Access ID: {access_id}")
-            print("Streaming will start only after RECEIVER_HELLO is received.\n")
+            print(f"\n>>> GIVE THIS ACCESS ID TO RECEIVER <<<")
+            print(f">>> SESSION ACCESS ID: {access_id} <<<")
+            print(f"\nStreaming will start only after RECEIVER_HELLO is received.")
+            print("="*60 + "\n")
         
         # Create heatmap window if enabled
         heatmap_enabled = SHOW_HEATMAP
@@ -416,9 +772,11 @@ def main():
                             print("Connection Debug: same-host receiver detected, using loopback target 127.0.0.1")
                     continue
 
-                if active_receiver_ip is not None and sender_ip != active_receiver_ip:
-                    # Ignore health events from non-selected receivers in connect-gated mode.
+                # Ignore health events from non-selected receivers in connect-gated mode.
+                if auto_connect_mode and active_receiver_ip is not None and sender_ip != active_receiver_ip:
                     continue
+
+                
 
                 if message.startswith("KEYFRAME_REQUEST"):
                     encoder.force_key_frame(reason=f"receiver_mismatch {message}")
