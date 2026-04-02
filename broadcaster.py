@@ -355,8 +355,12 @@ class HWNDWindowCapture:
             mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
             bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, client_width, client_height)
             gdi32.SelectObject(mem_dc, bitmap)
+            PW_RENDERFULLCONTENT = 0x2
             PW_CLIENTONLY = 0x1
-            result = user32.PrintWindow(self.hwnd, mem_dc, PW_CLIENTONLY)
+
+            result = user32.PrintWindow(self.hwnd, mem_dc, PW_RENDERFULLCONTENT)
+            if result == 0:
+                result = user32.PrintWindow(self.hwnd, mem_dc, PW_CLIENTONLY)
             if result == 0:
                 screen_dc = user32.GetDC(0)
                 gdi32.BitBlt(mem_dc, 0, 0, client_width, client_height, screen_dc, x, y, 0x00CC0020)

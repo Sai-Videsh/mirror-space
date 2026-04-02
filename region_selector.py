@@ -106,15 +106,10 @@ class WindowEnumerator:
                 height = y2 - y
                 
                 # CRITICAL: Validate window is on-screen and has valid dimensions
+                # Only reject truly invalid windows (zero/negative size)
                 if width <= 0 or height <= 0:
                     return
-                
-                # Reject windows that are completely off-screen or have negative positions 
-                # that would cause capture errors
-                if x2 <= 0 or y2 <= 0:  # Window entirely off-screen (left/top)
-                    return
-                
-                # Accept windows even if partially off-screen (mss handles this in set_region)
+
                 windows.append(WindowInfo(title, x, y, width, height, hwnd))
             except Exception as e:
                 # Silently skip windows that cause errors
@@ -348,7 +343,7 @@ def select_window(enable_presentation_mode: bool = False) -> Optional[RegionConf
     
     for i, window in enumerate(windows, 1):
         # Display window info with validation status
-        on_screen_status = "✓ On-screen" if window.x >= 0 and window.y >= 0 else "⚠ Partially off-screen"
+        on_screen_status = "✓ On-screen" if window.width > 0 and window.height > 0 else "⚠ Invalid"
         print(f"{i:2d}. {window.title}")
         print(f"    Size: {window.width}x{window.height} at ({window.x}, {window.y}) [{on_screen_status}]")
     
