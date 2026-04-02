@@ -24,7 +24,7 @@ python receiver.py
 
 **Terminal 2 (Broadcaster):**
 ```powershell
-python broadcaster.py
+python broadcaster.py 127.0.0.1
 ```
 
 You should see your screen mirrored instantly!
@@ -48,64 +48,47 @@ Total download: ~100 MB (one-time)
 python receiver.py
 
 # Terminal 2
-python broadcaster.py
+python broadcaster.py 127.0.0.1
 ```
 
 ### Network Broadcasting
 ```powershell
-# On viewing PC
+# On viewing PC (find IP with: ipconfig)
 python receiver.py
 
 # On broadcasting PC
-python broadcaster.py
+python broadcaster.py 192.168.1.100
 ```
-
-### LAN Auto Discovery (mDNS / Zeroconf)
-
-Receivers now automatically discover broadcasters on your LAN.
-
-Receiver console example:
-
-```text
-Available Streams:
-* Kousthub-PC (192.168.1.23)
-- Lab-System (192.168.1.40)
-```
-
-- `*` marks the currently selected stream.
-- No manual IP entry is required in normal LAN use.
-
-### Connection-Gated Streaming (New)
-
-The broadcaster no longer pushes video immediately in auto-discovery mode.
-
-Flow:
-
-1. Broadcaster starts and advertises "ready" on mDNS.
-2. Receiver discovers available streams and auto-selects one.
-3. Receiver sends a connect hello (`RECEIVER_HELLO`).
-4. Broadcaster logs receiver connection and starts streaming.
-
-This ensures streaming starts only after a receiver has connected.
 
 ### Custom Port
 ```powershell
 python receiver.py 8888
-python broadcaster.py 255.255.255.255 8888
+python broadcaster.py 192.168.1.100 8888
 ```
 
-### Adjust FPS
-Edit `broadcaster.py`:
-```python
-TARGET_FPS = 20  # Lower for less bandwidth
-TARGET_FPS = 60  # Higher for smoother
-```
+### Adaptive Streaming (Ultra-Low-Latency)
+The broadcaster now adapts in real time using receiver feedback:
+
+- FPS (frame pacing)
+- Resolution (max stream width)
+- Compression (JPEG quality + diff threshold)
+
+Adaptation inputs:
+
+- Packet loss ratio
+- Partial/timed-out frame ratio
+- Receiver effective FPS
 
 ## Configuration
 
 ### In `broadcaster.py`:
 ```python
-TARGET_FPS = 30              # Frames per second
+INITIAL_TARGET_FPS = 20      # Starting FPS before adaptation
+MIN_STREAM_FPS = 8
+MAX_STREAM_FPS = 45
+INITIAL_STREAM_WIDTH = 1280
+INITIAL_JPEG_QUALITY = 60
+INITIAL_DIFF_THRESHOLD = 10
 ```
 
 ### In `diff_encoder.py` (both files):
@@ -138,6 +121,15 @@ The sender now uses a dynamic key-frame strategy instead of fixed "every 60 fram
 - Sends key frame when receiver reports network instability
 
 This improves stream resilience under packet loss and rapid scene changes.
+
+## Adaptive Streaming Engine (v2)
+
+The broadcaster now runs a closed-loop adaptation controller:
+
+- Receiver sends periodic `STREAM_STATS` with packet loss, partial-frame ratio, timeout ratio, and receive FPS.
+- Broadcaster downshifts aggressively under congestion to protect latency (lower FPS, lower resolution, stronger compression).
+- Broadcaster recovers gradually as conditions improve to avoid oscillation.
+- Configuration changes force key-frame resynchronization to keep decoder state stable.
 
 ## Python vs C++
 

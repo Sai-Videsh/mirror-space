@@ -49,6 +49,18 @@ class DiffFrameEncoder:
         self.motion_vectors: Optional[np.ndarray] = None  # Motion vector grid
         self.motion_blocks = []  # Blocks with significant motion
 
+    def set_jpeg_quality(self, jpeg_quality: int):
+        """Update JPEG quality used for full/key frames."""
+        self.jpeg_quality = max(30, min(95, int(jpeg_quality)))
+
+    def set_threshold(self, threshold: int):
+        """Update diff sensitivity threshold (higher means fewer changed blocks)."""
+        self.threshold = max(1, int(threshold))
+
+    def set_motion_detection(self, enabled: bool):
+        """Enable or disable motion-based encoding at runtime."""
+        self.enable_motion_detection = bool(enabled)
+
     
     def _has_block_changed(self, frame1: np.ndarray, frame2: np.ndarray,
                           x: int, y: int, width: int, height: int) -> bool:
@@ -308,6 +320,11 @@ class DiffFrameEncoder:
     
     def encode(self, frame: np.ndarray, frame_number: int) -> bytes:
         """Encode a frame using motion-based, diff, or key frame method"""
+        if self.previous_frame is not None and self.previous_frame.shape != frame.shape:
+            # Resolution changed; reset reference chain and force resync.
+            self.previous_gray = None
+            self.force_key_frame(reason="resolution_changed")
+
         send_key_frame = self.key_frame_needed or self.previous_frame is None
         diff_data = None
         

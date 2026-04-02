@@ -25,10 +25,10 @@ DEFAULT_PORT = 9999
 SERVICE_TYPE = "_mirror-space._udp.local."
 DISCOVERY_BEACON_PORT = 10001
 MAX_PACKET_SIZE = 65507
-RECEIVE_TIMEOUT = 0.05  # seconds
+RECEIVE_TIMEOUT = 0.01  # seconds
 FRAGMENT_HEADER_SIZE = 12  # total_packets (4) + packet_index (4) + frame_number (4)
 DISCOVERY_INTERVAL_SECONDS = 1.0
-REASSEMBLY_WINDOW_SECONDS = 0.60
+REASSEMBLY_WINDOW_SECONDS = 0.18
 SUBNET_SCAN_INTERVAL_SECONDS = 8.0
 SUBNET_SCAN_BATCH_SIZE = 24
 
@@ -416,6 +416,10 @@ class UDPReceiver:
     def __init__(self, port: int):
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)  # IPTOS_LOWDELAY
+        except OSError:
+            pass
         
         # Bind to all interfaces
         self.sock.bind(('0.0.0.0', port))
@@ -423,8 +427,8 @@ class UDPReceiver:
         # Set receive timeout
         self.sock.settimeout(RECEIVE_TIMEOUT)
         
-        # Increase receive buffer size
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024*1024)
+        # Keep receive buffer moderate to avoid deep queue latency.
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
 
         # Packet health statistics
         self.complete_frames = 0
@@ -657,9 +661,13 @@ def main():
         
         # Receiving loop
         frames_received = 0
+        last_measured_receive_fps = 0.0
         fps_start_time = time.time()
         health_window_start = time.time()
         window_partial_frames = 0
+        window_complete_frames = 0
+        window_meta_frames = 0
+        window_timed_out_frames = 0
         window_missing_packets = 0
         window_total_packets = 0
         sender_ip: Optional[str] = None
@@ -798,7 +806,7 @@ def main():
                 if decode_error and sender_ip:
                     feedback.send(
                         sender_ip,
-                        port + 1,
+                        selected_stream_feedback_port or (port + 1),
                         f"KEYFRAME_REQUEST reason={decode_error}",
                         throttle_seconds=0.2,
                         throttle_key="KEYFRAME_REQUEST",
@@ -810,23 +818,51 @@ def main():
                     frames_received += 1
 
             if meta:
+                window_meta_frames += 1
                 window_total_packets += meta.get("total_packets", 0)
                 window_missing_packets += meta.get("missing_packets", 0)
-                if not meta.get("complete", True):
+                if meta.get("complete", True):
+                    window_complete_frames += 1
+                else:
                     window_partial_frames += 1
+                    if meta.get("timed_out", False):
+                        window_timed_out_frames += 1
 
             # Periodically report network instability to force sender key frames.
             health_elapsed = time.time() - health_window_start
-            if health_elapsed >= 2.0:
+            if health_elapsed >= 1.0:
                 packet_loss_ratio = (
                     window_missing_packets / window_total_packets if window_total_packets > 0 else 0.0
                 )
+                partial_ratio = (
+                    window_partial_frames / window_meta_frames if window_meta_frames > 0 else 0.0
+                )
+                timeout_ratio = (
+                    window_timed_out_frames / window_meta_frames if window_meta_frames > 0 else 0.0
+                )
                 unstable = window_partial_frames >= 2 or packet_loss_ratio >= 0.05
+
+                if sender_ip:
+                    feedback.send(
+                        sender_ip,
+                        selected_stream_feedback_port or (port + 1),
+                        (
+                            "STREAM_STATS "
+                            f"recv_fps={last_measured_receive_fps:.2f} "
+                            f"packet_loss={packet_loss_ratio:.6f} "
+                            f"partial_ratio={partial_ratio:.6f} "
+                            f"timeout_ratio={timeout_ratio:.6f} "
+                            f"complete_frames={window_complete_frames} "
+                            f"partial_frames={window_partial_frames}"
+                        ),
+                        throttle_seconds=0.2,
+                        throttle_key="STREAM_STATS",
+                    )
 
                 if unstable and sender_ip:
                     feedback.send(
                         sender_ip,
-                        port + 1,
+                        selected_stream_feedback_port or (port + 1),
                         (
                             "NETWORK_UNSTABLE "
                             f"partial_frames={window_partial_frames} "
@@ -837,6 +873,9 @@ def main():
                     )
 
                 window_partial_frames = 0
+                window_complete_frames = 0
+                window_meta_frames = 0
+                window_timed_out_frames = 0
                 window_missing_packets = 0
                 window_total_packets = 0
                 health_window_start = time.time()
@@ -845,6 +884,7 @@ def main():
             elapsed = time.time() - fps_start_time
             if elapsed >= 1.0:
                 actual_fps = frames_received / elapsed
+                last_measured_receive_fps = actual_fps
                 if connected or frames_received > 0:
                     print(f"Receive FPS: {actual_fps:.1f}")
                 frames_received = 0

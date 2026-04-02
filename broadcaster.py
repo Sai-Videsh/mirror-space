@@ -8,7 +8,7 @@ import time
 import socket
 import struct
 import secrets
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 
 import mss
 import numpy as np
@@ -26,13 +26,20 @@ DISCOVERY_BEACON_INTERVAL = 1.0
 MAX_PACKET_SIZE = 65507  # Max UDP packet size
 FRAGMENT_HEADER_SIZE = 12  # total_packets (4) + packet_index (4) + frame_number (4)
 MAX_UDP_PAYLOAD_SIZE = 1400  # MTU-safe payload to avoid IP fragmentation on LAN/WiFi
-TARGET_FPS = 15
-FRAME_INTERVAL = 1.0 / TARGET_FPS
-SHOW_HEATMAP = True  # Set to False to disable heatmap overlay
+INITIAL_TARGET_FPS = 20
+MIN_STREAM_FPS = 8
+MAX_STREAM_FPS = 45
+SHOW_HEATMAP = False  # Disable by default to prioritize low-latency pipeline timing.
 MAX_CHANGED_BLOCK_RATIO = 0.35  # Fallback to key frame when too many blocks change
 MAX_DIFF_PAYLOAD_RATIO = 0.25  # Fallback to key frame when diff payload gets too large
-JPEG_QUALITY = 60  # Lower quality reduces packet count and loss on busy scenes
-MAX_STREAM_WIDTH = 1280  # Resize captured frame if screen width is larger than this
+INITIAL_JPEG_QUALITY = 60
+MIN_JPEG_QUALITY = 35
+MAX_JPEG_QUALITY = 85
+INITIAL_DIFF_THRESHOLD = 10
+MIN_DIFF_THRESHOLD = 6
+MAX_DIFF_THRESHOLD = 24
+ADAPTIVE_WIDTH_STEPS = [640, 854, 960, 1280, 1600, 1920, 2560]
+INITIAL_STREAM_WIDTH = 1280
 ENABLE_MOTION_DETECTION = True  # Enable optical flow-based motion encoding
 
 
@@ -132,9 +139,13 @@ class UDPBroadcaster:
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)  # IPTOS_LOWDELAY
+        except OSError:
+            pass
         
-        # Increase send buffer size
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024*1024)
+        # Keep buffer moderate to reduce queue-induced latency under congestion.
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
         
         print(f"UDP broadcaster initialized to {target_ip}:{port}")
     
@@ -220,6 +231,168 @@ class FeedbackReceiver:
             print(f"Feedback send failed: {e}")
 
 
+def _parse_message_tokens(message: str) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for token in message.split()[1:]:
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        values[key] = value
+    return values
+
+
+def _clamp_int(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, value))
+
+
+class AdaptiveStreamingController:
+    """Adjusts stream quality knobs to keep latency low under changing network conditions."""
+
+    def __init__(self):
+        self.min_fps = MIN_STREAM_FPS
+        self.max_fps = MAX_STREAM_FPS
+        self.width_steps = ADAPTIVE_WIDTH_STEPS
+
+        self.current_fps = _clamp_int(INITIAL_TARGET_FPS, self.min_fps, self.max_fps)
+        self.current_width = self._pick_width(INITIAL_STREAM_WIDTH)
+        self.current_jpeg_quality = _clamp_int(INITIAL_JPEG_QUALITY, MIN_JPEG_QUALITY, MAX_JPEG_QUALITY)
+        self.current_diff_threshold = _clamp_int(
+            INITIAL_DIFF_THRESHOLD,
+            MIN_DIFF_THRESHOLD,
+            MAX_DIFF_THRESHOLD,
+        )
+
+        self._bad_windows = 0
+        self._good_windows = 0
+        self._last_adjust_time = 0.0
+
+    def _pick_width(self, requested_width: int) -> int:
+        for width in reversed(self.width_steps):
+            if width <= requested_width:
+                return width
+        return self.width_steps[0]
+
+    def _width_index(self) -> int:
+        return self.width_steps.index(self.current_width)
+
+    def get_frame_interval(self) -> float:
+        return 1.0 / float(self.current_fps)
+
+    def _degrade(self, severe: bool) -> bool:
+        changed = False
+
+        fps_scale = 0.70 if severe else 0.85
+        next_fps = _clamp_int(int(round(self.current_fps * fps_scale)), self.min_fps, self.max_fps)
+        if next_fps == self.current_fps and self.current_fps > self.min_fps:
+            next_fps = self.current_fps - 1
+        if next_fps != self.current_fps:
+            self.current_fps = next_fps
+            changed = True
+
+        width_drop = 2 if severe else 1
+        next_width_index = max(0, self._width_index() - width_drop)
+        if self.width_steps[next_width_index] != self.current_width:
+            self.current_width = self.width_steps[next_width_index]
+            changed = True
+
+        quality_drop = 8 if severe else 4
+        next_quality = _clamp_int(self.current_jpeg_quality - quality_drop, MIN_JPEG_QUALITY, MAX_JPEG_QUALITY)
+        if next_quality != self.current_jpeg_quality:
+            self.current_jpeg_quality = next_quality
+            changed = True
+
+        threshold_rise = 3 if severe else 2
+        next_threshold = _clamp_int(
+            self.current_diff_threshold + threshold_rise,
+            MIN_DIFF_THRESHOLD,
+            MAX_DIFF_THRESHOLD,
+        )
+        if next_threshold != self.current_diff_threshold:
+            self.current_diff_threshold = next_threshold
+            changed = True
+
+        return changed
+
+    def _upgrade(self) -> bool:
+        changed = False
+
+        next_fps = _clamp_int(self.current_fps + 2, self.min_fps, self.max_fps)
+        if next_fps != self.current_fps:
+            self.current_fps = next_fps
+            changed = True
+
+        next_width_index = min(len(self.width_steps) - 1, self._width_index() + 1)
+        if self.width_steps[next_width_index] != self.current_width:
+            self.current_width = self.width_steps[next_width_index]
+            changed = True
+
+        next_quality = _clamp_int(self.current_jpeg_quality + 2, MIN_JPEG_QUALITY, MAX_JPEG_QUALITY)
+        if next_quality != self.current_jpeg_quality:
+            self.current_jpeg_quality = next_quality
+            changed = True
+
+        next_threshold = _clamp_int(
+            self.current_diff_threshold - 1,
+            MIN_DIFF_THRESHOLD,
+            MAX_DIFF_THRESHOLD,
+        )
+        if next_threshold != self.current_diff_threshold:
+            self.current_diff_threshold = next_threshold
+            changed = True
+
+        return changed
+
+    def apply_feedback(self, stats: Dict[str, float], now: float) -> Tuple[bool, str]:
+        """Adapt quality levels from receiver packet loss, partial frames, and receiver FPS."""
+        if now - self._last_adjust_time < 1.0:
+            return False, ""
+
+        packet_loss = stats.get("packet_loss", 0.0)
+        partial_ratio = stats.get("partial_ratio", 0.0)
+        recv_fps = stats.get("recv_fps", 0.0)
+
+        severe = packet_loss >= 0.12 or partial_ratio >= 0.25
+        bad = severe or packet_loss >= 0.05 or partial_ratio >= 0.10
+        if recv_fps > 0.0 and recv_fps < (self.current_fps * 0.70):
+            bad = True
+
+        good = packet_loss <= 0.01 and partial_ratio <= 0.02
+        if recv_fps > 0.0:
+            good = good and recv_fps >= (self.current_fps * 0.90)
+
+        changed = False
+        decision = ""
+
+        if bad:
+            self._bad_windows += 1
+            self._good_windows = 0
+            required = 1 if severe else 2
+            if self._bad_windows >= required:
+                changed = self._degrade(severe=severe)
+                self._bad_windows = 0
+                decision = "severe_congestion" if severe else "congestion"
+        elif good:
+            self._good_windows += 1
+            self._bad_windows = 0
+            if self._good_windows >= 4:
+                changed = self._upgrade()
+                self._good_windows = 0
+                decision = "network_recovered"
+        else:
+            self._bad_windows = 0
+            self._good_windows = 0
+
+        if changed:
+            self._last_adjust_time = now
+            summary = (
+                f"{decision} recv_fps={recv_fps:.1f} "
+                f"loss={packet_loss:.1%} partial={partial_ratio:.1%}"
+            )
+            return True, summary
+
+        return False, ""
+
+
 class ScreenCapture:
     """Captures screen using mss library"""
     
@@ -301,11 +474,11 @@ def main():
     
     print("=== Mirror-Space Screen Broadcaster (Python) ===")
     print(f"Target: {target_ip}:{port}")
-    print(f"Target FPS: {TARGET_FPS}")
+    print(f"Initial FPS: {INITIAL_TARGET_FPS}")
     print(f"Max Changed Block Ratio: {MAX_CHANGED_BLOCK_RATIO:.0%}")
     print(f"Max Diff Payload Ratio: {MAX_DIFF_PAYLOAD_RATIO:.0%}")
-    print(f"JPEG Quality: {JPEG_QUALITY}")
-    print(f"Max Stream Width: {MAX_STREAM_WIDTH}")
+    print(f"Initial JPEG Quality: {INITIAL_JPEG_QUALITY}")
+    print(f"Initial Max Stream Width: {INITIAL_STREAM_WIDTH}")
     print(f"Motion Detection: {'Enabled' if ENABLE_MOTION_DETECTION else 'Disabled'}")
     print(f"Heatmap Overlay: {'Enabled' if SHOW_HEATMAP else 'Disabled'}")
     print("Press Ctrl+C to stop...")
@@ -320,14 +493,15 @@ def main():
     feedback_receiver = None
     advertiser = None
     beacon = None
+    adaptive = AdaptiveStreamingController()
     try:
         capture = ScreenCapture()
         encoder = DiffFrameEncoder(
             block_size=32,
-            threshold=10,
+            threshold=adaptive.current_diff_threshold,
             max_changed_block_ratio=MAX_CHANGED_BLOCK_RATIO,
             max_diff_payload_ratio=MAX_DIFF_PAYLOAD_RATIO,
-            jpeg_quality=JPEG_QUALITY,
+            jpeg_quality=adaptive.current_jpeg_quality,
             enable_motion_detection=ENABLE_MOTION_DETECTION,
         )
         broadcaster = UDPBroadcaster(target_ip, port)
@@ -355,8 +529,6 @@ def main():
         
         # Broadcasting loop
         frame_number = 0
-        if SHOW_HEATMAP:
-            cv2.destroyAllWindows()
         fps_counter = 0
         fps_start_time = time.time()
         
@@ -424,6 +596,34 @@ def main():
                     encoder.force_key_frame(reason=f"receiver_mismatch {message}")
                 elif message.startswith("NETWORK_UNSTABLE"):
                     encoder.force_key_frame(reason=f"network_instability {message}")
+                elif message.startswith("STREAM_STATS"):
+                    fields = _parse_message_tokens(message)
+
+                    def _as_float(name: str) -> float:
+                        raw = fields.get(name, "0")
+                        try:
+                            return float(raw)
+                        except ValueError:
+                            return 0.0
+
+                    stats = {
+                        "recv_fps": _as_float("recv_fps"),
+                        "packet_loss": _as_float("packet_loss"),
+                        "partial_ratio": _as_float("partial_ratio"),
+                    }
+
+                    changed, reason = adaptive.apply_feedback(stats, now=time.time())
+                    if changed:
+                        encoder.set_jpeg_quality(adaptive.current_jpeg_quality)
+                        encoder.set_threshold(adaptive.current_diff_threshold)
+                        encoder.force_key_frame(reason=f"adaptive_reconfigure {reason}")
+                        print(
+                            "Adaptive update: "
+                            f"fps={adaptive.current_fps} "
+                            f"width={adaptive.current_width} "
+                            f"jpeg={adaptive.current_jpeg_quality} "
+                            f"threshold={adaptive.current_diff_threshold}"
+                        )
 
             if auto_connect_mode and active_receiver_ip is None:
                 now = time.time()
@@ -437,10 +637,14 @@ def main():
             frame = capture.capture_frame()
 
             # Limit stream resolution for high-motion scenes to reduce packet loss.
-            if frame.shape[1] > MAX_STREAM_WIDTH:
-                scale = MAX_STREAM_WIDTH / frame.shape[1]
+            if frame.shape[1] > adaptive.current_width:
+                scale = adaptive.current_width / frame.shape[1]
                 resized_height = max(1, int(frame.shape[0] * scale))
-                frame = cv2.resize(frame, (MAX_STREAM_WIDTH, resized_height), interpolation=cv2.INTER_AREA)
+                frame = cv2.resize(
+                    frame,
+                    (adaptive.current_width, resized_height),
+                    interpolation=cv2.INTER_AREA,
+                )
             
             # Encode frame
             encoded_data = encoder.encode(frame, frame_number)
@@ -482,13 +686,16 @@ def main():
             elapsed = time.time() - fps_start_time
             if elapsed >= 1.0:
                 actual_fps = fps_counter / elapsed
-                print(f"Actual FPS: {actual_fps:.1f}")
+                print(
+                    f"Actual FPS: {actual_fps:.1f} | target={adaptive.current_fps} "
+                    f"width={adaptive.current_width} jpeg={adaptive.current_jpeg_quality}"
+                )
                 fps_counter = 0
                 fps_start_time = time.time()
             
             # Frame rate limiting
             frame_time = time.time() - frame_start
-            sleep_time = FRAME_INTERVAL - frame_time
+            sleep_time = adaptive.get_frame_interval() - frame_time
             if sleep_time > 0:
                 time.sleep(sleep_time)
     
