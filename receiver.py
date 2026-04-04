@@ -704,6 +704,7 @@ def main():
         
         # Create display window
         cv2.namedWindow("Mirror-Space Receiver", cv2.WINDOW_NORMAL)
+        last_display_size: Optional[Tuple[int, int]] = None
         
         # Receiving loop
         frames_received = 0
@@ -897,6 +898,12 @@ def main():
                     )
                 
                 if frame is not None:
+                    frame_height, frame_width = frame.shape[:2]
+                    display_size = (frame_width, frame_height)
+                    if display_size != last_display_size:
+                        cv2.resizeWindow("Mirror-Space Receiver", frame_width, frame_height)
+                        last_display_size = display_size
+
                     sender_ts_ns = meta.get("sender_timestamp_ns") if meta else None
                     if isinstance(sender_ts_ns, int):
                         frame_latency_ms = (time.time_ns() - sender_ts_ns) / 1_000_000.0

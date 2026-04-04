@@ -35,21 +35,21 @@ DISCOVERY_BEACON_INTERVAL = 1.0
 MAX_PACKET_SIZE = 65507  # Max UDP packet size
 FRAGMENT_HEADER_SIZE = 20  # total (4) + index (4) + frame (4) + send_time_ns (8)
 MAX_UDP_PAYLOAD_SIZE = 1400  # MTU-safe payload to avoid IP fragmentation on LAN/WiFi
-INITIAL_TARGET_FPS = 20
-MIN_STREAM_FPS = 8
+INITIAL_TARGET_FPS = 30
+MIN_STREAM_FPS = 30
 MAX_STREAM_FPS = 45
 SHOW_HEATMAP = False  # Disable by default to prioritize stream latency.
-MAX_CHANGED_BLOCK_RATIO = 0.35  # Fallback to key frame when too many blocks change
-MAX_DIFF_PAYLOAD_RATIO = 0.25  # Fallback to key frame when diff payload gets too large
-INITIAL_JPEG_QUALITY = 60
-MIN_JPEG_QUALITY = 35
-MAX_JPEG_QUALITY = 85
-INITIAL_DIFF_THRESHOLD = 4
-MIN_DIFF_THRESHOLD = 3
+MAX_CHANGED_BLOCK_RATIO = 0.22  # Fallback to key frame when too many blocks change
+MAX_DIFF_PAYLOAD_RATIO = 0.15  # Fallback to key frame when diff payload gets too large
+INITIAL_JPEG_QUALITY = 92
+MIN_JPEG_QUALITY = 75
+MAX_JPEG_QUALITY = 95
+INITIAL_DIFF_THRESHOLD = 3
+MIN_DIFF_THRESHOLD = 2
 MAX_DIFF_THRESHOLD = 20
-ADAPTIVE_WIDTH_STEPS = [640, 854, 960, 1280, 1600, 1920, 2560]
-INITIAL_STREAM_WIDTH = 1280
-ENABLE_MOTION_DETECTION = True  # Enable optical flow-based motion encoding
+ADAPTIVE_WIDTH_STEPS = [640, 854, 960, 1280, 1600, 1920, 2560, 3200, 3840]
+INITIAL_STREAM_WIDTH = 3840
+ENABLE_MOTION_DETECTION = False  # Disable optical flow overhead to keep latency lower.
 RECEIVER_STALE_SECONDS = 8.0  # Drop inactive receivers in auto-connect mode
 
 
@@ -308,7 +308,7 @@ class AdaptiveStreamingController:
     def _degrade(self, severe: bool) -> bool:
         changed = False
 
-        fps_scale = 0.70 if severe else 0.85
+        fps_scale = 0.90 if severe else 0.95
         next_fps = _clamp_int(int(round(self.current_fps * fps_scale)), self.min_fps, self.max_fps)
         if next_fps == self.current_fps and self.current_fps > self.min_fps:
             next_fps = self.current_fps - 1
@@ -316,19 +316,19 @@ class AdaptiveStreamingController:
             self.current_fps = next_fps
             changed = True
 
-        width_drop = 2 if severe else 1
+        width_drop = 0
         next_width_index = max(0, self._width_index() - width_drop)
         if self.width_steps[next_width_index] != self.current_width:
             self.current_width = self.width_steps[next_width_index]
             changed = True
 
-        quality_drop = 8 if severe else 4
+        quality_drop = 2 if severe else 1
         next_quality = _clamp_int(self.current_jpeg_quality - quality_drop, MIN_JPEG_QUALITY, MAX_JPEG_QUALITY)
         if next_quality != self.current_jpeg_quality:
             self.current_jpeg_quality = next_quality
             changed = True
 
-        threshold_rise = 2 if severe else 1
+        threshold_rise = 0
         next_threshold = _clamp_int(self.current_diff_threshold + threshold_rise, MIN_DIFF_THRESHOLD, MAX_DIFF_THRESHOLD)
         if next_threshold != self.current_diff_threshold:
             self.current_diff_threshold = next_threshold
@@ -349,7 +349,7 @@ class AdaptiveStreamingController:
             self.current_width = self.width_steps[next_width_index]
             changed = True
 
-        next_quality = _clamp_int(self.current_jpeg_quality + 2, MIN_JPEG_QUALITY, MAX_JPEG_QUALITY)
+        next_quality = _clamp_int(self.current_jpeg_quality + 1, MIN_JPEG_QUALITY, MAX_JPEG_QUALITY)
         if next_quality != self.current_jpeg_quality:
             self.current_jpeg_quality = next_quality
             changed = True
@@ -857,7 +857,7 @@ def main():
         capture.set_region(region_config.x, region_config.y, region_config.width, region_config.height, region_config.hwnd, region_config.presentation_mode)
         
         encoder = DiffFrameEncoder(
-            block_size=16,
+            block_size=8,
             threshold=adaptive.current_diff_threshold,
             max_changed_block_ratio=MAX_CHANGED_BLOCK_RATIO,
             max_diff_payload_ratio=MAX_DIFF_PAYLOAD_RATIO,
